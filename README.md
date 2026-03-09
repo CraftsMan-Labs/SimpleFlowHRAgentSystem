@@ -48,6 +48,7 @@ Additional helper endpoints:
 ```bash
 cp backend/.env.example backend/.env
 cp frontend/.env.example frontend/.env
+docker compose build hr-backend hr-frontend
 make up
 ```
 
@@ -59,6 +60,13 @@ http://localhost:5175
 ```
 
 Use `make logs` to stream both services and `make down` to stop them.
+
+## Container startup optimization
+
+- Backend image now preinstalls OS/Python dependencies during `docker build`.
+- Frontend image now preinstalls `node_modules` during `docker build`.
+- Runtime container commands are now lightweight and skip `apt-get`/`pip install`/`npm install` on every start.
+- `./backend`, `./frontend`, `./workflows`, and sibling SDK/agent repos are still mounted for local editable development.
 
 ## Control-plane-first chat flow
 
@@ -85,9 +93,11 @@ If provider credentials are not set (`CUSTOM_API_KEY` or provider-specific env v
 ## Local verification
 
 ```bash
+docker compose up -d --build hr-backend hr-frontend
 make test-backend
 make build-frontend
 curl -sS http://localhost:8092/health
+curl -sS http://localhost:5175
 ```
 
 ## Control-plane linking
@@ -107,6 +117,6 @@ Required networking notes:
 ## Notes
 
 - Start the SimpleFlow stack first so external Docker network `simpleflow_default` exists.
-- `make up` installs backend dependencies in-container from sibling repos:
+- Docker build context is set to `../..` so backend/frontend images can include sibling repos at build time:
   - `../../SimpleFlowSDKs/python`
   - `../../SimpleAgents/crates/simple-agents-py`

@@ -66,23 +66,32 @@ Invoke trust is enabled in template examples.
 - `RUNTIME_INVOKE_TRUST_ENABLED=true`
 - `RUNTIME_INVOKE_TOKEN_ISSUER`
 - `RUNTIME_INVOKE_TOKEN_AUDIENCE`
-- Exactly one of:
-  - `RUNTIME_INVOKE_TOKEN_SIGNING_KEY`
-  - `RUNTIME_INVOKE_TOKEN_JWKS_URL`
+- Preferred (production): `RUNTIME_INVOKE_TOKEN_JWKS_URL` pointing to SimpleFlow runtime JWKS (`/.well-known/runtime-invoke-jwks.json`)
+- Legacy fallback: `RUNTIME_INVOKE_TOKEN_SIGNING_KEY` for HS256 shared-secret verification
+
+If both JWKS and signing key are set, JWKS verification is used.
 
 When enabled, `/invoke` requires `Authorization: Bearer <token>`.
 
 ## Bootstrap vars
 
-Startup bootstrap vars are intentionally removed from default examples for this template sync. Add them only when you explicitly need startup registration automation.
+HR runtime is expected to auto-onboard during backend startup. Set:
+
+- `RUNTIME_BOOTSTRAP_REGISTER_ON_STARTUP=true`
+- `RUNTIME_BOOTSTRAP_VALIDATE_REGISTRATION=true`
+- `RUNTIME_BOOTSTRAP_ACTIVATE_REGISTRATION=true`
+- `RUNTIME_BOOTSTRAP_RUNTIME_ID`
+- `RUNTIME_BOOTSTRAP_ENDPOINT_URL`
 
 ## Optional control-plane env vars
 
 - `SIMPLEFLOW_API_BASE_URL`
-- `SIMPLEFLOW_API_TOKEN`
+- `SIMPLEFLOW_CLIENT_ID` (preferred)
+- `SIMPLEFLOW_CLIENT_SECRET` (preferred)
+- `SIMPLEFLOW_API_TOKEN` (legacy fallback)
 - `RUNTIME_AGENT_CATALOG_JSON` (optional JSON array for multi-agent selector)
 
-When configured, runtime emits events/chat/queue writes to SimpleFlow APIs, gateway endpoints proxy control-plane requests through `SimpleFlowClient` with bearer-token passthrough, and onboarding lifecycle (`create -> validate -> activate`) uses SDK lifecycle helpers.
+When configured, runtime emits events/chat/queue writes to SimpleFlow APIs, gateway endpoints proxy control-plane requests through `SimpleFlowClient` with bearer-token passthrough, and onboarding lifecycle (`create -> validate -> activate`) uses SDK lifecycle helpers. With client credentials configured, the SDK auto-fetches short-lived access tokens from `/v1/oauth/token`.
 
 ## Tests
 
