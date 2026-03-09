@@ -11,6 +11,22 @@ SimpleFlow-compatible Python runtime with workflow execution backed by SimpleAge
 - `POST /queue/enqueue`
 - `POST /queue/process`
 
+Control-plane gateway endpoints (frontend-facing):
+
+- `POST /api/control-plane/auth/sessions`
+- `DELETE /api/control-plane/auth/sessions/current`
+- `GET /api/control-plane/me`
+- `GET /api/control-plane/runtime/registrations`
+- `POST /api/control-plane/runtime/invoke`
+- `GET /api/control-plane/chat/history/sessions`
+- `GET /api/control-plane/chat/history/messages`
+- `POST /api/control-plane/chat/history/messages`
+- `PATCH /api/control-plane/chat/history/messages/{message_id}`
+- `GET /api/agents/available`
+- `POST /api/onboarding/start`
+- `GET /api/onboarding/status`
+- `POST /api/onboarding/retry`
+
 ## Setup
 
 ```bash
@@ -64,8 +80,9 @@ Startup bootstrap vars are intentionally removed from default examples for this 
 
 - `SIMPLEFLOW_API_BASE_URL`
 - `SIMPLEFLOW_API_TOKEN`
+- `RUNTIME_AGENT_CATALOG_JSON` (optional JSON array for multi-agent selector)
 
-When configured, runtime emits events/chat/queue writes to SimpleFlow APIs.
+When configured, runtime emits events/chat/queue writes to SimpleFlow APIs, gateway endpoints proxy control-plane requests through `SimpleFlowClient` with bearer-token passthrough, and onboarding lifecycle (`create -> validate -> activate`) uses SDK lifecycle helpers.
 
 ## Tests
 

@@ -66,6 +66,18 @@ def _install_test_stubs() -> None:
 
                 return decorator
 
+            def delete(self, *args, **kwargs):
+                def decorator(func):
+                    return func
+
+                return decorator
+
+            def patch(self, *args, **kwargs):
+                def decorator(func):
+                    return func
+
+                return decorator
+
             def on_event(self, *args, **kwargs):
                 def decorator(func):
                     return func
@@ -114,7 +126,34 @@ def _install_test_stubs() -> None:
 
         class SimpleFlowClient:
             def __init__(self, *args, **kwargs):
-                pass
+                self._base_url = "http://stub"
+
+                class _Client:
+                    @staticmethod
+                    def delete(url: str, headers=None):
+                        class _Response:
+                            status_code = 200
+                            text = "{}"
+
+                            @staticmethod
+                            def json():
+                                return {}
+
+                        return _Response()
+
+                self._client = _Client()
+
+            def close(self):
+                return None
+
+            def _get(self, path: str):
+                return {}
+
+            def _post(self, path: str, payload):
+                return {}
+
+            def _patch(self, path: str, payload):
+                return {}
 
             def register_runtime(self, registration):
                 return {}
@@ -124,6 +163,9 @@ def _install_test_stubs() -> None:
 
             def activate_runtime_registration(self, registration_id: str):
                 return None
+
+            def ensure_runtime_registration_active(self, registration):
+                return {"registration_id": "reg_123", "status": "active"}
 
             def report_runtime_event(self, event):
                 return None
@@ -140,6 +182,9 @@ def _install_test_stubs() -> None:
         setattr(sdk_stub, "RuntimeRegistration", _SimpleType)
         setattr(sdk_stub, "SimpleFlowClient", SimpleFlowClient)
         setattr(sdk_stub, "InvokeTokenVerifier", InvokeTokenVerifier)
+        setattr(sdk_stub, "SimpleFlowAuthenticationError", RuntimeError)
+        setattr(sdk_stub, "SimpleFlowAuthorizationError", RuntimeError)
+        setattr(sdk_stub, "SimpleFlowLifecycleError", RuntimeError)
         sys.modules["simpleflow_sdk"] = sdk_stub
 
     if "simple_agents_py" not in sys.modules:
@@ -168,13 +213,15 @@ def _install_test_stubs() -> None:
 class RuntimeTemplateTests(unittest.TestCase):
     def test_trust_config_requires_issuer_when_enabled(self) -> None:
         _install_test_stubs()
+        os.environ["RUNTIME_INVOKE_TRUST_ENABLED"] = "false"
+        import app as runtime_app
+
+        runtime_app = importlib.reload(runtime_app)
         os.environ["RUNTIME_INVOKE_TRUST_ENABLED"] = "true"
         os.environ.pop("RUNTIME_INVOKE_TOKEN_ISSUER", None)
         os.environ["RUNTIME_INVOKE_TOKEN_AUDIENCE"] = "runtime"
         os.environ["RUNTIME_INVOKE_TOKEN_SIGNING_KEY"] = "secret"
         os.environ.pop("RUNTIME_INVOKE_TOKEN_JWKS_URL", None)
-
-        import app as runtime_app
 
         with self.assertRaises(ValueError):
             runtime_app._build_invoke_trust_config()
@@ -241,6 +288,31 @@ class RuntimeTemplateTests(unittest.TestCase):
         )
         self.assertIn("Subject: Policy Reminder", text)
         self.assertIn("Please improve attendance.", text)
+
+    def test_build_agent_catalog_uses_primary_agent(self) -> None:
+        _install_test_stubs()
+        os.environ["RUNTIME_INVOKE_TRUST_ENABLED"] = "false"
+        os.environ["RUNTIME_AGENT_ID"] = "hr-agent-runtime"
+        os.environ["RUNTIME_AGENT_VERSION"] = "v1"
+        import app as runtime_app
+
+        runtime_app = importlib.reload(runtime_app)
+        catalog = runtime_app._build_agent_catalog()
+        self.assertGreaterEqual(len(catalog), 1)
+        self.assertEqual(catalog[0]["agent_id"], "hr-agent-runtime")
+
+    def test_onboarding_default_state_not_started(self) -> None:
+        _install_test_stubs()
+        os.environ["RUNTIME_INVOKE_TRUST_ENABLED"] = "false"
+        import app as runtime_app
+
+        runtime_app = importlib.reload(runtime_app)
+        state = runtime_app._get_or_create_onboarding_state(
+            runtime_app.agent_id,
+            runtime_app.agent_version,
+        )
+        self.assertEqual(state["state"], "not_started")
+        self.assertEqual(state["steps"]["create"], "pending")
 
 
 if __name__ == "__main__":

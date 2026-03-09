@@ -4,8 +4,8 @@ Standalone test repo for an HR-focused SimpleFlow runtime built from SimpleFlow 
 
 ## What this repo includes
 
-- `backend/`: Python runtime service compatible with SimpleFlow runtime contract.
-- `frontend/`: Vue chat shell that requires control-plane sign-in, registration preflight, and control-plane invoke/history APIs.
+- `backend/`: Python runtime service compatible with SimpleFlow runtime contract, plus a local control-plane gateway built on `SimpleFlowClient`.
+- `frontend/`: Vue chat shell that talks only to the template backend (`/api/control-plane/*`) for sign-in, preflight, invoke, and chat history.
 - `workflows/`: YAML workflows copied from prior SimpleAgentChatTemplate setup.
 
 ## Runtime contract
@@ -13,6 +13,29 @@ Standalone test repo for an HR-focused SimpleFlow runtime built from SimpleFlow 
 - `GET /health`
 - `GET /meta`
 - `POST /invoke`
+
+## Template backend control-plane gateway
+
+The frontend never calls control-plane URLs directly. It calls backend-local gateway routes:
+
+- `POST /api/control-plane/auth/sessions`
+- `DELETE /api/control-plane/auth/sessions/current`
+- `GET /api/control-plane/me`
+- `GET /api/control-plane/runtime/registrations`
+- `POST /api/control-plane/runtime/invoke`
+- `GET /api/control-plane/chat/history/sessions`
+- `GET /api/control-plane/chat/history/messages`
+- `POST /api/control-plane/chat/history/messages`
+- `PATCH /api/control-plane/chat/history/messages/{message_id}`
+
+Backend then calls control-plane APIs through `SimpleFlowClient` with incoming bearer-token passthrough.
+
+Canonical onboarding endpoints exposed by template backend:
+
+- `GET /api/agents/available`
+- `POST /api/onboarding/start`
+- `GET /api/onboarding/status`
+- `POST /api/onboarding/retry`
 
 Additional helper endpoints:
 
@@ -39,14 +62,14 @@ Use `make logs` to stream both services and `make down` to stop them.
 
 ## Control-plane-first chat flow
 
-- Frontend sign-in uses `POST /v1/auth/sessions` and stores the access token locally.
-- Chat is disabled until preflight finds an `active` registration for the selected `(agent_id, agent_version)`.
-- Chat invoke uses `POST /v1/runtime/invoke` only (no direct browser call to runtime `/invoke`).
+- Frontend sign-in uses `POST /api/control-plane/auth/sessions` and stores the access token locally.
+- Frontend first selects from backend-provided agents and then uses onboarding status (`start/status/retry`) until selected agent is `active`.
+- Chat invoke uses `POST /api/control-plane/runtime/invoke` only (no direct browser call to runtime `/invoke`).
 - Chat sessions persist with stable `chat_id` values and use:
-  - `GET /v1/chat/history/sessions`
-  - `GET /v1/chat/history/messages`
-  - `POST /v1/chat/history/messages`
-  - `PATCH /v1/chat/history/messages/{message_id}`
+  - `GET /api/control-plane/chat/history/sessions`
+  - `GET /api/control-plane/chat/history/messages`
+  - `POST /api/control-plane/chat/history/messages`
+  - `PATCH /api/control-plane/chat/history/messages/{message_id}`
 
 ## Workflows
 

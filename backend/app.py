@@ -3,10 +3,13 @@ from __future__ import annotations
 import logging
 import os
 import time
+import json
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlencode
+from uuid import uuid4
 
 import jwt
 from fastapi import FastAPI, HTTPException, Request
@@ -19,7 +22,10 @@ from simpleflow_sdk import (
     QueueContract,
     RuntimeEvent,
     RuntimeRegistration,
+    SimpleFlowAuthenticationError,
+    SimpleFlowAuthorizationError,
     SimpleFlowClient,
+    SimpleFlowLifecycleError,
 )
 
 
@@ -112,6 +118,56 @@ simple_agents_provider = (
 )
 simple_agents_api_base = os.getenv("CUSTOM_API_BASE", "").strip()
 simple_agents_api_key = os.getenv("CUSTOM_API_KEY", "").strip()
+
+
+def _agent_key(runtime_agent_id: str, runtime_agent_version: str) -> str:
+    return f"{runtime_agent_id.strip()}::{runtime_agent_version.strip()}"
+
+
+def _build_agent_catalog() -> list[dict[str, Any]]:
+    catalog: list[dict[str, Any]] = []
+    primary = {
+        "agent_id": agent_id,
+        "agent_version": agent_version,
+        "runtime_id": os.getenv("RUNTIME_BOOTSTRAP_RUNTIME_ID", "").strip(),
+        "endpoint_url": os.getenv("RUNTIME_BOOTSTRAP_ENDPOINT_URL", "").strip(),
+        "enabled": True,
+    }
+    catalog.append(primary)
+
+    raw = os.getenv("RUNTIME_AGENT_CATALOG_JSON", "").strip()
+    if raw != "":
+        try:
+            decoded = json.loads(raw)
+            if isinstance(decoded, list):
+                for item in decoded:
+                    if not isinstance(item, dict):
+                        continue
+                    runtime_agent_id = str(item.get("agent_id", "")).strip()
+                    runtime_agent_version = str(item.get("agent_version", "")).strip()
+                    if runtime_agent_id == "" or runtime_agent_version == "":
+                        continue
+                    catalog.append(
+                        {
+                            "agent_id": runtime_agent_id,
+                            "agent_version": runtime_agent_version,
+                            "runtime_id": str(item.get("runtime_id", "")).strip(),
+                            "endpoint_url": str(item.get("endpoint_url", "")).strip(),
+                            "enabled": bool(item.get("enabled", True)),
+                        }
+                    )
+        except json.JSONDecodeError:
+            logger.warning("invalid RUNTIME_AGENT_CATALOG_JSON; ignoring value")
+
+    deduped: dict[str, dict[str, Any]] = {}
+    for item in catalog:
+        key = _agent_key(item["agent_id"], item["agent_version"])
+        deduped[key] = item
+    return [entry for entry in deduped.values() if bool(entry.get("enabled", True))]
+
+
+agent_catalog = _build_agent_catalog()
+onboarding_states: dict[str, dict[str, Any]] = {}
 
 
 def env_bool(key: str, fallback: bool = False) -> bool:
@@ -408,6 +464,316 @@ def _run_startup_bootstrap() -> None:
             logger.warning("runtime bootstrap activate failed: %s", exc)
 
 
+def _read_auth_bearer_token(request: Request) -> str:
+    authorization = request.headers.get("authorization", "").strip()
+    if authorization == "":
+        return ""
+
+    parts = authorization.split(" ", 1)
+    if len(parts) != 2 or parts[0].strip().lower() != "bearer":
+        raise HTTPException(status_code=401, detail="invalid authorization header")
+
+    token = parts[1].strip()
+    if token == "":
+        raise HTTPException(status_code=401, detail="invalid authorization header")
+    return token
+
+
+def _build_control_plane_client(
+    request: Request,
+    *,
+    require_bearer: bool = False,
+    allow_api_token_fallback: bool = True,
+) -> SimpleFlowClient:
+    if api_base_url == "":
+        raise HTTPException(
+            status_code=503,
+            detail="control plane is not configured; set SIMPLEFLOW_API_BASE_URL",
+        )
+
+    bearer_token = _read_auth_bearer_token(request)
+    if require_bearer and bearer_token == "":
+        raise HTTPException(status_code=401, detail="authorization required")
+
+    selected_token = bearer_token
+    if selected_token == "" and allow_api_token_fallback:
+        selected_token = api_token
+    return SimpleFlowClient(api_base_url, selected_token)
+
+
+def _control_plane_query_path(path: str, query: dict[str, Any]) -> str:
+    encoded = urlencode(query)
+    if encoded == "":
+        return path
+    return f"{path}?{encoded}"
+
+
+def _map_control_plane_error(exc: Exception) -> HTTPException:
+    raw = str(exc).strip()
+    status_code = 502
+    detail = raw if raw != "" else "control-plane request failed"
+
+    if "status=" in raw:
+        try:
+            status_fragment = raw.split("status=", 1)[1].split(" ", 1)[0]
+            status_code = int(status_fragment)
+        except Exception:  # noqa: BLE001
+            status_code = 502
+
+    if "body=" in raw:
+        body = raw.split("body=", 1)[1].strip()
+        if body != "":
+            detail = body
+
+    return HTTPException(status_code=status_code, detail=detail)
+
+
+def _control_plane_get(
+    request: Request,
+    *,
+    path: str,
+    require_bearer: bool = False,
+) -> dict[str, Any]:
+    client = _build_control_plane_client(request, require_bearer=require_bearer)
+    try:
+        return client._get(path)
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise _map_control_plane_error(exc) from exc
+    finally:
+        client.close()
+
+
+def _control_plane_post(
+    request: Request,
+    *,
+    path: str,
+    payload: dict[str, Any],
+    require_bearer: bool = False,
+    allow_api_token_fallback: bool = True,
+) -> dict[str, Any]:
+    client = _build_control_plane_client(
+        request,
+        require_bearer=require_bearer,
+        allow_api_token_fallback=allow_api_token_fallback,
+    )
+    try:
+        return client._post(path, payload)
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise _map_control_plane_error(exc) from exc
+    finally:
+        client.close()
+
+
+def _control_plane_patch(
+    request: Request,
+    *,
+    path: str,
+    payload: dict[str, Any],
+    require_bearer: bool = False,
+) -> dict[str, Any]:
+    client = _build_control_plane_client(request, require_bearer=require_bearer)
+    try:
+        return client._patch(path, payload)
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise _map_control_plane_error(exc) from exc
+    finally:
+        client.close()
+
+
+def _control_plane_delete(
+    request: Request,
+    *,
+    path: str,
+    require_bearer: bool = False,
+) -> dict[str, Any]:
+    client = _build_control_plane_client(request, require_bearer=require_bearer)
+    try:
+        normalized_path = path if path.startswith("/") else f"/{path}"
+        url = f"{api_base_url.rstrip('/')}{normalized_path}"
+        headers: dict[str, str] = {}
+        token = _read_auth_bearer_token(request)
+        if token != "":
+            headers["Authorization"] = f"Bearer {token}"
+        elif api_token != "":
+            headers["Authorization"] = f"Bearer {api_token}"
+
+        response = client._client.delete(url, headers=headers)
+        if response.status_code < 200 or response.status_code >= 300:
+            raise RuntimeError(
+                f"simpleflow sdk request error: status={response.status_code} body={response.text.strip()}"
+            )
+        if response.text.strip() == "":
+            return {}
+        decoded = response.json()
+        if isinstance(decoded, dict):
+            return decoded
+        return {}
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise _map_control_plane_error(exc) from exc
+    finally:
+        client.close()
+
+
+def _require_operator_auth(request: Request) -> None:
+    token = _read_auth_bearer_token(request)
+    if token == "":
+        raise HTTPException(status_code=401, detail="authorization required")
+
+
+def _find_agent_config(
+    runtime_agent_id: str, runtime_agent_version: str
+) -> dict[str, Any] | None:
+    key = _agent_key(runtime_agent_id, runtime_agent_version)
+    for item in agent_catalog:
+        if _agent_key(item.get("agent_id", ""), item.get("agent_version", "")) == key:
+            return item
+    return None
+
+
+def _require_known_agent(runtime_agent_id: str, runtime_agent_version: str) -> None:
+    if _find_agent_config(runtime_agent_id, runtime_agent_version) is not None:
+        return
+    raise HTTPException(status_code=404, detail="agent is not available in catalog")
+
+
+def _require_known_agent_id(runtime_agent_id: str) -> None:
+    trimmed = runtime_agent_id.strip()
+    for item in agent_catalog:
+        if str(item.get("agent_id", "")).strip() == trimmed:
+            return
+    raise HTTPException(status_code=404, detail="agent is not available in catalog")
+
+
+def _onboarding_state_from_catalog(item: dict[str, Any]) -> dict[str, Any]:
+    state = {
+        "onboarding_id": f"onb_{uuid4().hex}",
+        "agent_id": str(item.get("agent_id", "")).strip(),
+        "agent_version": str(item.get("agent_version", "")).strip(),
+        "runtime_id": str(item.get("runtime_id", "")).strip(),
+        "endpoint_url": str(item.get("endpoint_url", "")).strip(),
+        "state": "not_started",
+        "message": "Onboarding has not started.",
+        "registration_id": "",
+        "steps": {
+            "create": "pending",
+            "validate": "pending",
+            "activate": "pending",
+        },
+    }
+    return state
+
+
+def _get_or_create_onboarding_state(
+    runtime_agent_id: str, runtime_agent_version: str
+) -> dict[str, Any]:
+    key = _agent_key(runtime_agent_id, runtime_agent_version)
+    existing = onboarding_states.get(key)
+    if existing is not None:
+        return existing
+
+    config = _find_agent_config(runtime_agent_id, runtime_agent_version)
+    if config is None:
+        raise HTTPException(status_code=404, detail="agent is not available in catalog")
+    state = _onboarding_state_from_catalog(config)
+    onboarding_states[key] = state
+    return state
+
+
+def _build_machine_control_plane_client() -> SimpleFlowClient:
+    if api_base_url == "":
+        raise HTTPException(
+            status_code=503,
+            detail="control plane is not configured; set SIMPLEFLOW_API_BASE_URL",
+        )
+    if api_token == "":
+        raise HTTPException(
+            status_code=503,
+            detail="machine lifecycle token is required; set SIMPLEFLOW_API_TOKEN",
+        )
+    return SimpleFlowClient(api_base_url, api_token)
+
+
+def _run_onboarding_lifecycle(
+    runtime_agent_id: str,
+    runtime_agent_version: str,
+) -> dict[str, Any]:
+    _require_known_agent(runtime_agent_id, runtime_agent_version)
+    state = _get_or_create_onboarding_state(runtime_agent_id, runtime_agent_version)
+    state["state"] = "in_progress"
+    state["message"] = "Running runtime registration lifecycle."
+    state["steps"] = {
+        "create": "running",
+        "validate": "pending",
+        "activate": "pending",
+    }
+
+    config = _find_agent_config(runtime_agent_id, runtime_agent_version)
+    if config is None:
+        raise HTTPException(status_code=404, detail="agent is not available in catalog")
+
+    registration = RuntimeRegistration(
+        agent_id=runtime_agent_id,
+        agent_version=runtime_agent_version,
+        execution_mode="remote_runtime",
+        endpoint_url=(str(config.get("endpoint_url", "")).strip() or None),
+        auth_mode="jwt",
+        capabilities=["chat", "webhook", "queue"],
+        runtime_id=(str(config.get("runtime_id", "")).strip() or None),
+    )
+
+    client = _build_machine_control_plane_client()
+    try:
+        result = client.ensure_runtime_registration_active(registration=registration)
+    except SimpleFlowAuthenticationError as exc:
+        state["state"] = "blocked"
+        state["message"] = "machine auth failed for onboarding lifecycle"
+        state["steps"]["create"] = "failed"
+        raise HTTPException(status_code=401, detail=str(exc)) from exc
+    except SimpleFlowAuthorizationError as exc:
+        state["state"] = "blocked"
+        state["message"] = "machine token lacks lifecycle scope"
+        state["steps"]["create"] = "failed"
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except SimpleFlowLifecycleError as exc:
+        state["state"] = "failed"
+        state["message"] = str(exc)
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+    except Exception as exc:  # noqa: BLE001
+        state["state"] = "failed"
+        state["message"] = str(exc)
+        raise _map_control_plane_error(exc) from exc
+    finally:
+        client.close()
+
+    state["registration_id"] = str(result.get("registration_id", "")).strip()
+    state["steps"]["create"] = "success"
+    state["steps"]["validate"] = "success"
+    state["steps"]["activate"] = "success"
+    state["state"] = "active"
+    state["message"] = "Runtime registration is active."
+    return state
+
+
+def _onboarding_public_view(state: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "onboarding_id": state.get("onboarding_id", ""),
+        "agent_id": state.get("agent_id", ""),
+        "agent_version": state.get("agent_version", ""),
+        "state": state.get("state", "not_started"),
+        "message": state.get("message", ""),
+        "registration_id": state.get("registration_id", ""),
+        "steps": state.get("steps", {}),
+    }
+
+
 @app.on_event("startup")
 def on_startup() -> None:
     _run_startup_bootstrap()
@@ -432,6 +798,206 @@ def meta() -> dict[str, Any]:
             "queue": "/queue/enqueue",
         },
     }
+
+
+@app.get("/api/agents/available")
+def available_agents(request: Request) -> dict[str, Any]:
+    _require_operator_auth(request)
+    agents: list[dict[str, Any]] = []
+    for item in agent_catalog:
+        state = _get_or_create_onboarding_state(
+            str(item.get("agent_id", "")).strip(),
+            str(item.get("agent_version", "")).strip(),
+        )
+        agents.append(
+            {
+                "agent_id": item.get("agent_id", ""),
+                "agent_version": item.get("agent_version", ""),
+                "runtime_id": item.get("runtime_id", ""),
+                "endpoint_url": item.get("endpoint_url", ""),
+                "onboarding": _onboarding_public_view(state),
+            }
+        )
+    return {
+        "agents": agents,
+        "default_agent": {
+            "agent_id": agent_id,
+            "agent_version": agent_version,
+        },
+    }
+
+
+@app.post("/api/onboarding/start")
+def onboarding_start(payload: dict[str, Any], request: Request) -> dict[str, Any]:
+    _require_operator_auth(request)
+    runtime_agent_id = str(payload.get("agent_id", agent_id)).strip()
+    runtime_agent_version = str(payload.get("agent_version", agent_version)).strip()
+    state = _run_onboarding_lifecycle(runtime_agent_id, runtime_agent_version)
+    return _onboarding_public_view(state)
+
+
+@app.get("/api/onboarding/status")
+def onboarding_status(
+    request: Request,
+    onboarding_id: str = "",
+    agent_id: str = "",
+    agent_version: str = "",
+) -> dict[str, Any]:
+    _require_operator_auth(request)
+    if onboarding_id.strip() != "":
+        for state in onboarding_states.values():
+            if str(state.get("onboarding_id", "")).strip() == onboarding_id.strip():
+                return _onboarding_public_view(state)
+        raise HTTPException(status_code=404, detail="onboarding record not found")
+
+    runtime_agent_id = (
+        agent_id.strip()
+        or os.getenv("RUNTIME_AGENT_ID", "sample-python-runtime").strip()
+    )
+    runtime_agent_version = (
+        agent_version.strip() or os.getenv("RUNTIME_AGENT_VERSION", "v1").strip()
+    )
+    state = _get_or_create_onboarding_state(runtime_agent_id, runtime_agent_version)
+    return _onboarding_public_view(state)
+
+
+@app.post("/api/onboarding/retry")
+def onboarding_retry(payload: dict[str, Any], request: Request) -> dict[str, Any]:
+    _require_operator_auth(request)
+    runtime_agent_id = str(payload.get("agent_id", agent_id)).strip()
+    runtime_agent_version = str(payload.get("agent_version", agent_version)).strip()
+    state = _run_onboarding_lifecycle(runtime_agent_id, runtime_agent_version)
+    return _onboarding_public_view(state)
+
+
+@app.post("/api/control-plane/auth/sessions")
+def control_plane_create_auth_session(
+    payload: dict[str, Any], request: Request
+) -> dict[str, Any]:
+    return _control_plane_post(
+        request,
+        path="/v1/auth/sessions",
+        payload=payload,
+        allow_api_token_fallback=False,
+    )
+
+
+@app.delete("/api/control-plane/auth/sessions/current")
+def control_plane_delete_auth_session(request: Request) -> dict[str, Any]:
+    return _control_plane_delete(
+        request,
+        path="/v1/auth/sessions/current",
+        require_bearer=True,
+    )
+
+
+@app.get("/api/control-plane/me")
+def control_plane_me(request: Request) -> dict[str, Any]:
+    return _control_plane_get(request, path="/v1/me", require_bearer=True)
+
+
+@app.get("/api/control-plane/runtime/registrations")
+def control_plane_runtime_registrations(
+    request: Request,
+    agent_id: str,
+    agent_version: str,
+) -> dict[str, Any]:
+    _require_known_agent(agent_id, agent_version)
+    path = _control_plane_query_path(
+        "/v1/runtime/registrations",
+        {
+            "agent_id": agent_id,
+            "agent_version": agent_version,
+        },
+    )
+    return _control_plane_get(request, path=path, require_bearer=True)
+
+
+@app.post("/api/control-plane/runtime/invoke")
+def control_plane_runtime_invoke(
+    payload: dict[str, Any], request: Request
+) -> dict[str, Any]:
+    invoke_agent_id = str(payload.get("agent_id", "")).strip()
+    invoke_agent_version = str(payload.get("agent_version", "")).strip()
+    _require_known_agent(invoke_agent_id, invoke_agent_version)
+    return _control_plane_post(
+        request,
+        path="/v1/runtime/invoke",
+        payload=payload,
+        require_bearer=True,
+    )
+
+
+@app.get("/api/control-plane/chat/history/sessions")
+def control_plane_chat_history_sessions(
+    request: Request,
+    agent_id: str,
+    user_id: str,
+    status: str = "active",
+    limit: int = 50,
+) -> dict[str, Any]:
+    _require_known_agent_id(agent_id)
+    path = _control_plane_query_path(
+        "/v1/chat/history/sessions",
+        {
+            "agent_id": agent_id,
+            "user_id": user_id,
+            "status": status,
+            "limit": limit,
+        },
+    )
+    return _control_plane_get(request, path=path, require_bearer=True)
+
+
+@app.get("/api/control-plane/chat/history/messages")
+def control_plane_chat_history_messages(
+    request: Request,
+    agent_id: str,
+    chat_id: str,
+    user_id: str,
+    limit: int = 200,
+) -> dict[str, Any]:
+    _require_known_agent_id(agent_id)
+    path = _control_plane_query_path(
+        "/v1/chat/history/messages",
+        {
+            "agent_id": agent_id,
+            "chat_id": chat_id,
+            "user_id": user_id,
+            "limit": limit,
+        },
+    )
+    return _control_plane_get(request, path=path, require_bearer=True)
+
+
+@app.post("/api/control-plane/chat/history/messages")
+def control_plane_create_chat_history_message(
+    payload: dict[str, Any], request: Request
+) -> dict[str, Any]:
+    payload_agent_id = str(payload.get("agent_id", "")).strip()
+    _require_known_agent_id(payload_agent_id)
+    return _control_plane_post(
+        request,
+        path="/v1/chat/history/messages",
+        payload=payload,
+        require_bearer=True,
+    )
+
+
+@app.patch("/api/control-plane/chat/history/messages/{message_id}")
+def control_plane_patch_chat_history_message(
+    message_id: str,
+    payload: dict[str, Any],
+    request: Request,
+) -> dict[str, Any]:
+    payload_agent_id = str(payload.get("agent_id", "")).strip()
+    _require_known_agent_id(payload_agent_id)
+    return _control_plane_patch(
+        request,
+        path=f"/v1/chat/history/messages/{message_id}",
+        payload=payload,
+        require_bearer=True,
+    )
 
 
 @app.post("/invoke")
