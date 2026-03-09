@@ -25,7 +25,7 @@ const showConfig = ref(false)
 
 const registrationGate = reactive({
   state: 'not_started',
-  message: 'Sign in to start onboarding.',
+  message: 'Sign in to initialize runtime connectivity.',
   registrationId: ''
 })
 const onboardingBusy = ref(false)
@@ -122,6 +122,63 @@ function normalizeError(parsed, response) {
   return response.statusText || 'Request failed'
 }
 
+function firstNonEmptyString(candidates) {
+  for (const item of candidates) {
+    if (typeof item === 'string' && item.trim() !== '') {
+      return item.trim()
+    }
+  }
+  return ''
+}
+
+function normalizeOnboardingPayload(payload) {
+  const state = firstNonEmptyString([payload?.state, payload?.State]).toLowerCase() || 'not_started'
+  const message = firstNonEmptyString([payload?.message, payload?.Message])
+  const registrationId = firstNonEmptyString([
+    payload?.registration_id,
+    payload?.registrationId,
+    payload?.RegistrationID,
+    payload?.id,
+    payload?.ID
+  ])
+  return {
+    state,
+    message,
+    registrationId
+  }
+}
+
+function normalizeIdentityPayload(payload) {
+  const user = payload && typeof payload.user === 'object' ? payload.user : null
+  const normalized = payload && typeof payload === 'object' ? { ...payload } : {}
+  const userId = firstNonEmptyString([
+    payload?.id,
+    payload?.user_id,
+    payload?.userId,
+    payload?.UserID,
+    user?.id,
+    user?.user_id,
+    user?.userId,
+    user?.UserID
+  ])
+  const organizationId = firstNonEmptyString([
+    payload?.organization_id,
+    payload?.organizationId,
+    payload?.OrganizationID,
+    user?.organization_id,
+    user?.organizationId,
+    user?.OrganizationID
+  ])
+
+  normalized.user_id = userId
+  normalized.organization_id = organizationId
+  return normalized
+}
+
+function normalizeAccessToken(payload) {
+  return firstNonEmptyString([payload?.access_token, payload?.accessToken, payload?.token])
+}
+
 async function requestControlPlane(path, options = {}) {
   const method = options.method || 'GET'
   const body = options.body
@@ -204,26 +261,17 @@ function clearLocalSession(notice = 'Signed out.') {
 }
 
 function readUserId() {
-  if (!me.value || typeof me.value !== 'object') {
-    return ''
-  }
-  const candidates = [me.value.id, me.value.user_id, me.value.userId]
-  for (const item of candidates) {
-    if (typeof item === 'string' && item.trim() !== '') {
-      return item.trim()
-    }
+  if (me.value && typeof me.value === 'object' && typeof me.value.user_id === 'string') {
+    return me.value.user_id.trim()
   }
   return ''
 }
 
 function readOrgId() {
-  if (!me.value || typeof me.value !== 'object') {
-    return 'local-org'
-  }
-  const candidates = [me.value.organization_id, me.value.organizationId]
-  for (const item of candidates) {
-    if (typeof item === 'string' && item.trim() !== '') {
-      return item.trim()
+  if (me.value && typeof me.value === 'object' && typeof me.value.organization_id === 'string') {
+    const organizationId = me.value.organization_id.trim()
+    if (organizationId !== '') {
+      return organizationId
     }
   }
   return 'local-org'
@@ -349,13 +397,13 @@ function _agentKey(id, version) {
 
 async function fetchMe() {
   const payload = await requestControlPlane('/api/control-plane/me', { method: 'GET' })
-  me.value = payload
+  me.value = normalizeIdentityPayload(payload)
 }
 
 async function preflightRegistration() {
   if (authState.value !== 'signed-in') {
     registrationGate.state = 'not_started'
-    registrationGate.message = 'Sign in to start onboarding.'
+    registrationGate.message = 'Sign in to initialize runtime connectivity.'
     registrationGate.registrationId = ''
     return
   }
@@ -378,9 +426,10 @@ async function preflightRegistration() {
       `/api/onboarding/status?agent_id=${encodeURIComponent(trimmedAgentId)}&agent_version=${encodeURIComponent(trimmedVersion)}`,
       { method: 'GET' }
     )
-    const state = typeof response?.state === 'string' ? response.state.trim().toLowerCase() : 'not_started'
-    const message = typeof response?.message === 'string' ? response.message : ''
-    registrationGate.registrationId = response?.registration_id || ''
+    const onboarding = normalizeOnboardingPayload(response)
+    const state = onboarding.state
+    const message = onboarding.message
+    registrationGate.registrationId = onboarding.registrationId
 
     if (state === 'active') {
       registrationGate.state = 'ready'
@@ -723,11 +772,7 @@ async function signIn() {
       }
     })
 
-    const token =
-      payload?.access_token ||
-      payload?.accessToken ||
-      payload?.token ||
-      ''
+    const token = normalizeAccessToken(payload)
     if (typeof token !== 'string' || token.trim() === '') {
       throw new Error('Sign-in succeeded but no access token returned.')
     }
@@ -921,12 +966,6 @@ onMounted(async () => {
 
         <div class="onboarding-actions">
           <p class="gate-message">{{ registrationGate.message }}</p>
-          <button v-if="registrationGate.state === 'missing'" type="button" class="btn" :disabled="onboardingBusy" @click="startOnboarding">
-            {{ onboardingBusy ? 'Starting...' : 'Start Onboarding' }}
-          </button>
-          <button v-if="registrationGate.state === 'error' || registrationGate.state === 'unauthorized'" type="button" class="btn" :disabled="onboardingBusy" @click="retryOnboarding">
-            {{ onboardingBusy ? 'Retrying...' : 'Retry Onboarding' }}
-          </button>
         </div>
 
         <section class="messages">
