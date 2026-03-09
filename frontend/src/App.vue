@@ -1,567 +1,287 @@
 <script setup>
 import { computed, ref } from 'vue'
 
-const runtimeBaseUrl = ref(import.meta.env.VITE_RUNTIME_BASE_URL || 'http://localhost:8091')
-const controlPlaneBaseUrl = ref(import.meta.env.VITE_CONTROL_PLANE_BASE_URL || 'http://localhost:8080')
-const controlPlaneToken = ref(import.meta.env.VITE_CONTROL_PLANE_TOKEN || '')
+const runtimeBaseUrl = ref(import.meta.env.VITE_RUNTIME_BASE_URL || 'http://localhost:8092')
 const invokeToken = ref('')
 
-const agentId = ref('sample-agent')
-const organizationId = ref('dev-org')
-const runtimeMessage = ref('Hello from Vue shell')
-const activeTab = ref('runtime')
+const agentId = ref('57253b0a-3cd5-4d5f-b89c-730591b838d7')
+const agentVersion = ref('v1')
+const tenantId = ref('2081ccab-6b15-4396-a8b9-e2bfa717783e')
 
-const webhookPayload = ref('{"event":"example.webhook","data":{"hello":"world"}}')
-const queuePayload = ref('{"event":"example.queue","payload":{"priority":"normal"}}')
-const registrationId = ref('')
+const draft = ref('')
+const busy = ref(false)
+const error = ref('')
+const showConfig = ref(false)
 
-const logs = ref([])
-const busyAction = ref('')
-
-const tabs = [
-  { id: 'runtime', label: 'Runtime Studio' },
-  { id: 'events', label: 'Event Sandbox' },
-  { id: 'registration', label: 'Registration Lifecycle' },
-]
-
-const canCallControlPlane = computed(() => controlPlaneBaseUrl.value.trim().length > 0)
-
-function traceId() {
-  return crypto.randomUUID().replaceAll('-', '')
-}
-
-function spanId() {
-  return crypto.randomUUID().replaceAll('-', '').slice(0, 16)
-}
-
-function recordLog(kind, status, response) {
-  const item = {
+const conversation = ref([
+  {
     id: crypto.randomUUID(),
-    kind,
-    status,
-    at: new Date().toISOString(),
-    response,
+    role: 'assistant',
+    text: 'Hi. I am the HR drafting assistant. Tell me the situation and I will draft the warning email.'
   }
-  logs.value = [item, ...logs.value].slice(0, 16)
+])
+
+const canSend = computed(() => draft.value.trim() !== '' && busy.value === false)
+
+function uuid() {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+    return crypto.randomUUID()
+  }
+  return `run-${Date.now()}`
 }
 
-function headersForRequest(includeInvokeToken = false, includeControlPlaneToken = false) {
-  const headers = { 'content-type': 'application/json' }
-
-  if (includeInvokeToken && invokeToken.value.trim().length > 0) {
-    headers.authorization = `Bearer ${invokeToken.value.trim()}`
-  }
-
-  if (includeControlPlaneToken && controlPlaneToken.value.trim().length > 0) {
-    headers.authorization = `Bearer ${controlPlaneToken.value.trim()}`
-  }
-
-  return headers
+function pushMessage(role, text) {
+  conversation.value.push({ id: crypto.randomUUID(), role, text })
 }
 
-async function requestJson(url, options) {
-  const response = await fetch(url, options)
-  const raw = await response.text()
-  let parsed = null
+function parseReply(payload) {
+  if (payload && typeof payload === 'object') {
+    if (typeof payload?.output?.reply === 'string') {
+      return payload.output.reply
+    }
+    if (typeof payload?.reply === 'string') {
+      return payload.reply
+    }
+  }
+  return JSON.stringify(payload, null, 2)
+}
 
-  if (raw.length > 0) {
+async function sendMessage() {
+  const text = draft.value.trim()
+  if (text === '' || busy.value) {
+    return
+  }
+
+  error.value = ''
+  pushMessage('user', text)
+  draft.value = ''
+  busy.value = true
+
+  const body = {
+    schema_version: 'v1',
+    run_id: uuid(),
+    agent_id: agentId.value.trim(),
+    agent_version: agentVersion.value.trim(),
+    mode: 'realtime',
+    trace: {
+      trace_id: `trace-${Date.now()}`,
+      span_id: `span-${Date.now()}`,
+      tenant_id: tenantId.value.trim()
+    },
+    input: { message: text },
+    deadline_ms: 0,
+    idempotency_key: uuid()
+  }
+
+  try {
+    const headers = { 'content-type': 'application/json' }
+    if (invokeToken.value.trim() !== '') {
+      headers.authorization = `Bearer ${invokeToken.value.trim()}`
+    }
+
+    const response = await fetch(`${runtimeBaseUrl.value.replace(/\/$/, '')}/invoke`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(body)
+    })
+
+    const raw = await response.text()
+    let parsed = raw
     try {
       parsed = JSON.parse(raw)
-    } catch {
+    } catch (_e) {
       parsed = raw
     }
-  }
 
-  if (!response.ok) {
-    throw new Error(`status ${response.status}: ${typeof parsed === 'string' ? parsed : JSON.stringify(parsed, null, 2)}`)
-  }
-
-  return {
-    status: response.status,
-    body: parsed,
-  }
-}
-
-async function runAction(kind, fn) {
-  busyAction.value = kind
-  try {
-    const result = await fn()
-    recordLog(kind, 'ok', result)
-  } catch (err) {
-    recordLog(kind, 'error', err instanceof Error ? err.message : 'Unknown failure')
-  } finally {
-    busyAction.value = ''
-  }
-}
-
-async function invokeRuntime() {
-  await runAction('invoke', async () => {
-    const body = {
-      schema_version: 'v1',
-      run_id: crypto.randomUUID(),
-      agent_id: agentId.value,
-      agent_version: 'v1',
-      mode: 'realtime',
-      trace: {
-        trace_id: traceId(),
-        span_id: spanId(),
-        tenant_id: organizationId.value,
-      },
-      input: { message: runtimeMessage.value },
-      deadline_ms: 0,
-      idempotency_key: crypto.randomUUID(),
+    if (!response.ok) {
+      throw new Error(typeof parsed === 'string' ? parsed : JSON.stringify(parsed, null, 2))
     }
 
-    return requestJson(`${runtimeBaseUrl.value}/invoke`, {
-      method: 'POST',
-      headers: headersForRequest(true, false),
-      body: JSON.stringify(body),
-    })
-  })
-}
-
-async function getHealth() {
-  await runAction('health', async () => {
-    return requestJson(`${runtimeBaseUrl.value}/health`, {
-      method: 'GET',
-      headers: { accept: 'application/json' },
-    })
-  })
-}
-
-async function getMeta() {
-  await runAction('meta', async () => {
-    return requestJson(`${runtimeBaseUrl.value}/meta`, {
-      method: 'GET',
-      headers: { accept: 'application/json' },
-    })
-  })
-}
-
-function parseJson(raw) {
-  return JSON.parse(raw)
-}
-
-async function sendWebhook() {
-  await runAction('webhook', async () => {
-    return requestJson(`${runtimeBaseUrl.value}/webhook`, {
-      method: 'POST',
-      headers: headersForRequest(false, false),
-      body: JSON.stringify(parseJson(webhookPayload.value)),
-    })
-  })
-}
-
-async function enqueueQueue() {
-  await runAction('queue-enqueue', async () => {
-    return requestJson(`${runtimeBaseUrl.value}/queue/enqueue`, {
-      method: 'POST',
-      headers: headersForRequest(false, false),
-      body: JSON.stringify(parseJson(queuePayload.value)),
-    })
-  })
-}
-
-async function processQueue() {
-  await runAction('queue-process', async () => {
-    return requestJson(`${runtimeBaseUrl.value}/queue/process`, {
-      method: 'POST',
-      headers: headersForRequest(false, false),
-      body: JSON.stringify(parseJson(queuePayload.value)),
-    })
-  })
-}
-
-async function registrationAction(action) {
-  if (registrationId.value.trim().length === 0) {
-    recordLog(`registration-${action}`, 'error', 'Enter a registration id first.')
-    return
+    pushMessage('assistant', parseReply(parsed))
+  } catch (e) {
+    const message = e instanceof Error ? e.message : 'Invoke failed'
+    error.value = message
+    pushMessage('assistant', `I could not complete that request.\n\n${message}`)
+  } finally {
+    busy.value = false
   }
-
-  if (!canCallControlPlane.value) {
-    recordLog(`registration-${action}`, 'error', 'Set VITE_CONTROL_PLANE_BASE_URL to call control-plane lifecycle APIs.')
-    return
-  }
-
-  await runAction(`registration-${action}`, async () => {
-    return requestJson(
-      `${controlPlaneBaseUrl.value}/v1/runtime/registrations/${registrationId.value.trim()}/${action}`,
-      {
-        method: 'POST',
-        headers: headersForRequest(false, true),
-      },
-    )
-  })
 }
 </script>
 
 <template>
-  <main class="shell">
-    <section class="hero">
-      <p class="eyebrow">SimpleFlow HR Agent System</p>
-      <h1>Runtime Control Surface</h1>
-      <p class="lead">
-        A single interface to exercise runtime invoke flows, optional event endpoints, and registration lifecycle controls.
-      </p>
-    </section>
-
-    <section class="panel config-panel">
-      <h2>Connection Settings</h2>
-      <div class="grid two-up">
-        <label>
-          Runtime Base URL
-          <input v-model="runtimeBaseUrl" type="text" />
-        </label>
-
-        <label>
-          Control Plane Base URL
-          <input v-model="controlPlaneBaseUrl" type="text" />
-        </label>
-
-        <label>
-          Control Plane Bearer Token
-          <input v-model="controlPlaneToken" type="password" placeholder="Optional for registration actions" />
-        </label>
-
-        <label>
-          Invoke Bearer Token
-          <input v-model="invokeToken" type="password" placeholder="Required when invoke trust is enabled" />
-        </label>
+  <main class="chat-shell">
+    <header class="chat-header">
+      <div>
+        <p class="kicker">SimpleFlow HR Agent System</p>
+        <h1>HR Chat</h1>
       </div>
-    </section>
-
-    <section class="tabs">
-      <button
-        v-for="tab in tabs"
-        :key="tab.id"
-        type="button"
-        class="tab"
-        :class="{ active: activeTab === tab.id }"
-        @click="activeTab = tab.id"
-      >
-        {{ tab.label }}
+      <button type="button" class="ghost" @click="showConfig = !showConfig">
+        {{ showConfig ? 'Hide Settings' : 'Settings' }}
       </button>
+    </header>
+
+    <section v-if="showConfig" class="config">
+      <label>
+        Runtime Base URL
+        <input v-model="runtimeBaseUrl" type="text" />
+      </label>
+      <label>
+        Agent ID
+        <input v-model="agentId" type="text" />
+      </label>
+      <label>
+        Agent Version
+        <input v-model="agentVersion" type="text" />
+      </label>
+      <label>
+        Tenant ID
+        <input v-model="tenantId" type="text" />
+      </label>
+      <label>
+        Invoke Bearer Token (optional)
+        <input v-model="invokeToken" type="password" />
+      </label>
     </section>
 
-    <section v-if="activeTab === 'runtime'" class="grid two-up">
-      <article class="panel">
-        <h3>Invoke Builder</h3>
-        <label>
-          Agent ID
-          <input v-model="agentId" type="text" />
-        </label>
-        <label>
-          Organization ID
-          <input v-model="organizationId" type="text" />
-        </label>
-        <label>
-          Message
-          <textarea v-model="runtimeMessage" rows="5" />
-        </label>
-        <button type="button" :disabled="busyAction.length > 0" @click="invokeRuntime">Invoke Runtime</button>
-      </article>
-
-      <article class="panel quick-actions">
-        <h3>Quick Runtime Checks</h3>
-        <p>Use these checks before any invoke test.</p>
-        <div class="stacked-buttons">
-          <button type="button" :disabled="busyAction.length > 0" @click="getHealth">GET /health</button>
-          <button type="button" :disabled="busyAction.length > 0" @click="getMeta">GET /meta</button>
-        </div>
-      </article>
-    </section>
-
-    <section v-if="activeTab === 'events'" class="grid two-up">
-      <article class="panel">
-        <h3>Webhook Playground</h3>
-        <label>
-          JSON payload for /webhook
-          <textarea v-model="webhookPayload" rows="8" />
-        </label>
-        <button type="button" :disabled="busyAction.length > 0" @click="sendWebhook">POST /webhook</button>
-      </article>
-
-      <article class="panel">
-        <h3>Queue Playground</h3>
-        <label>
-          JSON payload for queue endpoints
-          <textarea v-model="queuePayload" rows="8" />
-        </label>
-        <div class="stacked-buttons">
-          <button type="button" :disabled="busyAction.length > 0" @click="enqueueQueue">POST /queue/enqueue</button>
-          <button type="button" :disabled="busyAction.length > 0" @click="processQueue">POST /queue/process</button>
-        </div>
+    <section class="messages">
+      <article v-for="msg in conversation" :key="msg.id" class="bubble" :class="msg.role">
+        <strong>{{ msg.role === 'assistant' ? 'HR Agent' : 'You' }}</strong>
+        <pre>{{ msg.text }}</pre>
       </article>
     </section>
 
-    <section v-if="activeTab === 'registration'" class="grid one-up">
-      <article class="panel">
-        <h3>Registration Lifecycle</h3>
-        <p>
-          Calls control-plane lifecycle endpoints for an existing registration id.
-          These endpoints are disabled by auth when the bearer token is missing or invalid.
-        </p>
-        <label>
-          Registration ID
-          <input v-model="registrationId" type="text" placeholder="runtime-reg-..." />
-        </label>
-        <div class="inline-buttons">
-          <button type="button" :disabled="busyAction.length > 0" @click="registrationAction('validate')">
-            Validate
-          </button>
-          <button type="button" :disabled="busyAction.length > 0" @click="registrationAction('activate')">
-            Activate
-          </button>
-          <button type="button" :disabled="busyAction.length > 0" @click="registrationAction('deactivate')">
-            Deactivate
-          </button>
-        </div>
-      </article>
-    </section>
-
-    <section class="panel logs">
-      <div class="logs-header">
-        <h3>Response Console</h3>
-        <button type="button" class="ghost" @click="logs = []">Clear</button>
+    <footer class="composer">
+      <textarea
+        v-model="draft"
+        rows="3"
+        placeholder="Describe the HR issue and ask for draft email..."
+        @keydown.enter.exact.prevent="sendMessage"
+      />
+      <div class="composer-actions">
+        <p v-if="error !== ''" class="error">{{ error }}</p>
+        <button type="button" :disabled="!canSend" @click="sendMessage">
+          {{ busy ? 'Sending...' : 'Send' }}
+        </button>
       </div>
-      <p v-if="logs.length === 0" class="muted">No requests yet. Run any action to see live responses.</p>
-
-      <article v-for="item in logs" :key="item.id" class="log-item" :class="item.status">
-        <header>
-          <strong>{{ item.kind }}</strong>
-          <span>{{ item.at }}</span>
-        </header>
-        <pre>{{ typeof item.response === 'string' ? item.response : JSON.stringify(item.response, null, 2) }}</pre>
-      </article>
-    </section>
+    </footer>
   </main>
 </template>
 
 <style scoped>
-@import url('https://fonts.googleapis.com/css2?family=Chivo:wght@400;500;700&family=IBM+Plex+Mono:wght@400;500&display=swap');
-
 :global(body) {
   margin: 0;
-  min-height: 100vh;
-  background:
-    radial-gradient(circle at 12% 18%, rgba(12, 138, 255, 0.25), transparent 45%),
-    radial-gradient(circle at 90% 5%, rgba(255, 127, 80, 0.3), transparent 36%),
-    linear-gradient(145deg, #f8f2e7 5%, #f2f4f8 45%, #eef4ff 100%);
-  color: #11243d;
+  background: linear-gradient(140deg, #f4f7fb 0%, #eef5ff 100%);
+  color: #10243f;
 }
 
-.shell {
-  --ink: #11243d;
-  --panel: rgba(255, 255, 255, 0.82);
-  --panel-border: rgba(17, 36, 61, 0.16);
-  --accent: #1d6eff;
-  --accent-strong: #0f52bf;
-  --accent-warm: #d04d14;
-  --ok: #076739;
-  --error: #8f1313;
-  width: min(1100px, calc(100vw - 2rem));
-  margin: 2rem auto 4rem;
+.chat-shell {
+  width: min(960px, calc(100vw - 2rem));
+  margin: 1.2rem auto;
   display: grid;
-  gap: 1rem;
+  gap: 0.9rem;
   font-family: 'Chivo', 'Trebuchet MS', sans-serif;
 }
 
-.hero {
-  background: rgba(255, 255, 255, 0.7);
-  border: 1px solid var(--panel-border);
-  border-radius: 1.2rem;
-  padding: 1.25rem 1.3rem;
-  backdrop-filter: blur(4px);
+.chat-header,
+.config,
+.messages,
+.composer {
+  background: rgba(255, 255, 255, 0.9);
+  border: 1px solid rgba(16, 36, 63, 0.14);
+  border-radius: 14px;
+  padding: 0.9rem;
 }
 
-.eyebrow {
+.chat-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.kicker {
   margin: 0;
+  font-size: 0.75rem;
   letter-spacing: 0.08em;
   text-transform: uppercase;
-  font-size: 0.75rem;
-  color: #455f87;
+  color: #3d5f90;
 }
 
-h1,
-h2,
-h3,
-p {
-  margin: 0;
-}
+h1 { margin: 0.2rem 0 0; }
 
-h1 {
-  margin-top: 0.4rem;
-  font-size: clamp(1.8rem, 2vw, 2.5rem);
-}
-
-.lead {
-  margin-top: 0.5rem;
-  max-width: 70ch;
-  color: #2d4668;
-}
-
-.panel {
-  background: var(--panel);
-  border: 1px solid var(--panel-border);
-  border-radius: 1rem;
-  padding: 1rem;
+.config {
   display: grid;
-  gap: 0.75rem;
-  box-shadow: 0 8px 18px rgba(17, 36, 61, 0.05);
-}
-
-.grid {
-  display: grid;
-  gap: 1rem;
-}
-
-.two-up {
   grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.6rem;
 }
 
-.one-up {
-  grid-template-columns: minmax(0, 1fr);
-}
-
-label {
-  display: grid;
-  gap: 0.3rem;
-  font-size: 0.9rem;
-  font-weight: 600;
-}
-
-input,
-textarea {
+label { display: grid; gap: 0.25rem; font-weight: 600; font-size: 0.9rem; }
+input, textarea {
   font: inherit;
-  border: 1px solid rgba(17, 36, 61, 0.22);
-  border-radius: 0.65rem;
-  padding: 0.68rem 0.75rem;
-  background: rgba(255, 255, 255, 0.9);
+  border: 1px solid rgba(16, 36, 63, 0.2);
+  border-radius: 10px;
+  padding: 0.6rem 0.7rem;
 }
 
-textarea {
-  resize: vertical;
-  min-height: 96px;
-  font-family: 'IBM Plex Mono', 'Courier New', monospace;
+.messages {
+  min-height: 52vh;
+  max-height: 62vh;
+  overflow: auto;
+  display: grid;
+  gap: 0.65rem;
+}
+
+.bubble {
+  max-width: 82%;
+  padding: 0.65rem;
+  border-radius: 10px;
+  border: 1px solid rgba(16, 36, 63, 0.12);
+  background: #f5f8fd;
+}
+
+.bubble.user {
+  margin-left: auto;
+  background: #dfeaff;
+}
+
+.bubble.assistant {
+  margin-right: auto;
+  background: #f6fbf2;
+}
+
+pre {
+  margin: 0.3rem 0 0;
+  white-space: pre-wrap;
+  font-family: 'IBM Plex Mono', monospace;
   font-size: 0.82rem;
 }
 
+.composer { display: grid; gap: 0.5rem; }
+
+.composer-actions {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
 button {
-  font: inherit;
-  font-weight: 600;
   border: 0;
   border-radius: 999px;
-  padding: 0.6rem 0.95rem;
+  padding: 0.55rem 1rem;
   cursor: pointer;
   color: white;
-  background: linear-gradient(130deg, var(--accent) 5%, var(--accent-strong) 85%);
-  transition: transform 0.12s ease, box-shadow 0.12s ease;
-}
-
-button:hover {
-  transform: translateY(-1px);
-  box-shadow: 0 6px 14px rgba(16, 83, 190, 0.25);
-}
-
-button:disabled {
-  opacity: 0.55;
-  cursor: not-allowed;
-  transform: none;
+  background: #1f62da;
 }
 
 .ghost {
   background: transparent;
-  color: var(--ink);
-  border: 1px solid rgba(17, 36, 61, 0.3);
+  border: 1px solid rgba(16, 36, 63, 0.3);
+  color: #163664;
 }
 
-.tabs {
-  display: flex;
-  gap: 0.5rem;
-  flex-wrap: wrap;
-}
+.error { margin: 0; color: #8b1f1f; font-weight: 600; font-size: 0.85rem; }
 
-.tab {
-  background: rgba(255, 255, 255, 0.66);
-  color: #1b3762;
-  border: 1px solid rgba(17, 36, 61, 0.15);
-}
-
-.tab.active {
-  color: white;
-  background: linear-gradient(130deg, var(--accent) 5%, var(--accent-warm) 90%);
-}
-
-.stacked-buttons,
-.inline-buttons {
-  display: flex;
-  gap: 0.55rem;
-  flex-wrap: wrap;
-}
-
-.quick-actions p {
-  color: #314d73;
-}
-
-.logs {
-  gap: 0.8rem;
-}
-
-.logs-header {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-}
-
-.muted {
-  color: #445d80;
-}
-
-.log-item {
-  border-radius: 0.8rem;
-  border: 1px solid rgba(17, 36, 61, 0.12);
-  background: rgba(255, 255, 255, 0.74);
-  padding: 0.75rem;
-  display: grid;
-  gap: 0.5rem;
-}
-
-.log-item header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 0.5rem;
-  font-size: 0.84rem;
-}
-
-.log-item.ok {
-  border-color: rgba(7, 103, 57, 0.35);
-}
-
-.log-item.error {
-  border-color: rgba(143, 19, 19, 0.4);
-}
-
-pre {
-  margin: 0;
-  padding: 0.65rem;
-  border-radius: 0.6rem;
-  background: rgba(17, 36, 61, 0.04);
-  border: 1px solid rgba(17, 36, 61, 0.1);
-  white-space: pre-wrap;
-  overflow-x: auto;
-  font-family: 'IBM Plex Mono', 'Courier New', monospace;
-  font-size: 0.78rem;
-  line-height: 1.45;
-}
-
-@media (max-width: 960px) {
-  .two-up {
-    grid-template-columns: minmax(0, 1fr);
-  }
-
-  .shell {
-    margin-top: 1rem;
-  }
+@media (max-width: 860px) {
+  .config { grid-template-columns: minmax(0, 1fr); }
+  .bubble { max-width: 95%; }
 }
 </style>
