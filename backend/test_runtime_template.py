@@ -211,6 +211,65 @@ def _install_test_stubs() -> None:
 
 
 class RuntimeTemplateTests(unittest.TestCase):
+    def test_extract_workflow_nerdstats_from_workflow_completed_event(self) -> None:
+        _install_test_stubs()
+        os.environ["RUNTIME_INVOKE_TRUST_ENABLED"] = "false"
+        import app as runtime_app
+
+        runtime_app = importlib.reload(runtime_app)
+        workflow_result = {
+            "events": [
+                {"event_type": "workflow_started", "metadata": {}},
+                {
+                    "event_type": "workflow_completed",
+                    "metadata": {
+                        "nerdstats": {
+                            "total_elapsed_ms": 123,
+                            "total_tokens": 456,
+                        }
+                    },
+                },
+            ]
+        }
+        nerdstats = runtime_app._extract_workflow_nerdstats(workflow_result)
+        self.assertIsInstance(nerdstats, dict)
+        self.assertEqual(nerdstats.get("total_tokens"), 456)
+
+    def test_build_chat_message_metadata_contains_trace_url(self) -> None:
+        _install_test_stubs()
+        os.environ["RUNTIME_INVOKE_TRUST_ENABLED"] = "false"
+        os.environ["TRACE_UI_BASE_URL"] = "http://localhost:16686"
+        import app as runtime_app
+
+        runtime_app = importlib.reload(runtime_app)
+        request = runtime_app.InvokeRequest(
+            schema_version="v1",
+            run_id="run_123",
+            agent_id="sample-python-runtime",
+            agent_version="v1",
+            mode="realtime",
+            trace=runtime_app.InvokeTrace(
+                trace_id="92f4be5ae517295005df76967d32984b",
+                span_id="span_1",
+                tenant_id="tenant_1",
+            ),
+            input={},
+        )
+        workflow_result = {
+            "workflow_id": "email-chat-draft-or-clarify",
+            "terminal_node": "generate_email_draft",
+            "trace": ["detect_scenario_context", "generate_email_draft"],
+            "step_timings": [],
+            "events": [],
+        }
+        metadata = runtime_app._build_chat_message_metadata(request, workflow_result)
+        trace_context = metadata.get("trace_context")
+        self.assertIsInstance(trace_context, dict)
+        self.assertEqual(
+            trace_context.get("trace_url"),
+            "http://localhost:16686/trace/92f4be5ae517295005df76967d32984b",
+        )
+
     def test_trust_config_requires_issuer_when_enabled(self) -> None:
         _install_test_stubs()
         os.environ["RUNTIME_INVOKE_TRUST_ENABLED"] = "false"

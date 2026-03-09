@@ -19,7 +19,8 @@ nodes:
         temperature: 0.0
         messages_path: input.messages
         append_prompt_as_user: true
-        stream: false
+        stream: true
+        stream_json_as_text: true
         heal: true
     config:
       output_schema:

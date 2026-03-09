@@ -369,6 +369,97 @@ def _workflow_text_output(terminal_output: Any) -> str:
     return str(terminal_output)
 
 
+def _extract_workflow_nerdstats(
+    workflow_result: dict[str, Any],
+) -> dict[str, Any] | None:
+    events = workflow_result.get("events")
+    if not isinstance(events, list):
+        return None
+
+    for event in reversed(events):
+        if not isinstance(event, dict):
+            continue
+        event_type = str(event.get("event_type", "")).strip()
+        if event_type != "workflow_completed":
+            continue
+        metadata = event.get("metadata")
+        if not isinstance(metadata, dict):
+            continue
+        nerdstats = metadata.get("nerdstats")
+        if isinstance(nerdstats, dict):
+            return nerdstats
+    return None
+
+
+def _count_workflow_events_by_type(workflow_result: dict[str, Any]) -> dict[str, int]:
+    events = workflow_result.get("events")
+    if not isinstance(events, list):
+        return {}
+
+    counts: dict[str, int] = {}
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        event_type = str(event.get("event_type", "")).strip()
+        if event_type == "":
+            continue
+        prior = counts.get(event_type, 0)
+        counts[event_type] = prior + 1
+    return counts
+
+
+def _build_trace_url(trace_id: str) -> str:
+    normalized_trace_id = trace_id.strip()
+    if normalized_trace_id == "":
+        return ""
+    base_url = os.getenv("TRACE_UI_BASE_URL", "http://localhost:16686").strip()
+    normalized_base_url = base_url.rstrip("/")
+    if normalized_base_url == "":
+        normalized_base_url = "http://localhost:16686"
+    return f"{normalized_base_url}/trace/{normalized_trace_id}"
+
+
+def _build_chat_message_content(
+    terminal_output: Any, workflow_result: dict[str, Any]
+) -> dict[str, Any]:
+    content: dict[str, Any] = {
+        "reply": _workflow_text_output(terminal_output),
+        "terminal_output": terminal_output,
+        "workflow": {
+            "workflow_id": workflow_result.get("workflow_id"),
+            "terminal_node": workflow_result.get("terminal_node"),
+        },
+    }
+    return content
+
+
+def _build_chat_message_metadata(
+    req: InvokeRequest, workflow_result: dict[str, Any]
+) -> dict[str, Any]:
+    trace_id = str(req.trace.trace_id).strip()
+    metadata: dict[str, Any] = {
+        "source": "runtime.workflow.invoke",
+        "workflow_id": workflow_result.get("workflow_id"),
+        "terminal_node": workflow_result.get("terminal_node"),
+        "trace": workflow_result.get("trace", []),
+        "step_timings": workflow_result.get("step_timings", []),
+        "event_counts": _count_workflow_events_by_type(workflow_result),
+        "nerdstats": _extract_workflow_nerdstats(workflow_result),
+        "llm_node_metrics": workflow_result.get("llm_node_metrics", {}),
+        "total_elapsed_ms": workflow_result.get("total_elapsed_ms"),
+        "trace_context": {
+            "trace_id": trace_id,
+            "span_id": str(req.trace.span_id).strip(),
+            "tenant_id": str(req.trace.tenant_id).strip(),
+            "trace_url": _build_trace_url(trace_id),
+        },
+    }
+    events = workflow_result.get("events")
+    if isinstance(events, list):
+        metadata["events"] = events
+    return metadata
+
+
 def _build_workflow_registry() -> dict[str, str]:
     subgraph_path = workflow_root / "hr-warning-email-subgraph.yaml"
     if not subgraph_path.exists():
@@ -1260,6 +1351,14 @@ def invoke(req: InvokeRequest, request: Request) -> dict[str, Any]:
 
     workflow_result = _run_agent_workflow(req)
     terminal_output = _workflow_text_output(workflow_result.get("terminal_output"))
+    chat_message_content = _build_chat_message_content(
+        workflow_result.get("terminal_output"), workflow_result
+    )
+    chat_message_metadata = _build_chat_message_metadata(req, workflow_result)
+    trace_context = chat_message_metadata.get("trace_context")
+    trace_url = ""
+    if isinstance(trace_context, dict):
+        trace_url = str(trace_context.get("trace_url", "")).strip()
 
     if sdk_client is not None:
         try:
@@ -1275,6 +1374,11 @@ def invoke(req: InvokeRequest, request: Request) -> dict[str, Any]:
                     payload={
                         "status": "ok",
                         "workflow_id": workflow_result.get("workflow_id"),
+                        "terminal_node": workflow_result.get("terminal_node"),
+                        "trace_id": req.trace.trace_id,
+                        "trace_url": trace_url,
+                        "event_counts": chat_message_metadata.get("event_counts", {}),
+                        "nerdstats": chat_message_metadata.get("nerdstats"),
                     },
                 )
             )
@@ -1284,7 +1388,8 @@ def invoke(req: InvokeRequest, request: Request) -> dict[str, Any]:
                     organization_id=scoped_org_id,
                     run_id=scoped_run_id,
                     role="assistant",
-                    content=terminal_output,
+                    content=chat_message_content,
+                    metadata=chat_message_metadata,
                     created_at_ms=now_ms,
                 )
             )
@@ -1299,6 +1404,7 @@ def invoke(req: InvokeRequest, request: Request) -> dict[str, Any]:
             "reply": terminal_output,
             "workflow_id": workflow_result.get("workflow_id"),
             "terminal_node": workflow_result.get("terminal_node"),
+            "trace_url": trace_url,
         },
         "error": None,
         "metrics": {
