@@ -1,37 +1,237 @@
 <script setup>
-import { computed, ref } from 'vue'
+import { computed, onMounted, reactive, ref, watch } from 'vue'
+import craftsmanLogo from './assets/CraftsmanLabs.svg'
+import craftsmanLogoWhite from './assets/CraftsmanLabs-white.svg'
+import { clearAccessToken, readAccessToken, storeAccessToken } from './authToken'
 
-const runtimeBaseUrl = ref(import.meta.env.VITE_RUNTIME_BASE_URL || 'http://localhost:8092')
-const invokeToken = ref('')
+const themeStorageKey = 'simpleflow-hr-theme'
 
-const agentId = ref('57253b0a-3cd5-4d5f-b89c-730591b838d7')
-const agentVersion = ref('v1')
-const tenantId = ref('2081ccab-6b15-4396-a8b9-e2bfa717783e')
+const controlPlaneBaseUrl = ref(import.meta.env.VITE_CONTROL_PLANE_BASE_URL || 'http://localhost:8080')
+const agentId = ref(import.meta.env.VITE_AGENT_ID || '')
+const agentVersion = ref(import.meta.env.VITE_AGENT_VERSION || 'v1')
 
-const draft = ref('')
-const busy = ref(false)
-const error = ref('')
+const email = ref('')
+const password = ref('')
+const authState = ref('signed-out')
+const authNotice = ref('Sign in to use control-plane invoke and chat history.')
+const authBusy = ref(false)
+
+const currentTheme = ref('dark')
+const me = ref(null)
+const accessToken = ref('')
 const showConfig = ref(false)
 
-const conversation = ref([
-  {
-    id: crypto.randomUUID(),
-    role: 'assistant',
-    text: 'Hi. I am the HR drafting assistant. Tell me the situation and I will draft the warning email.'
-  }
-])
+const registrationGate = reactive({
+  state: 'unknown',
+  message: 'Sign in to validate runtime registration.',
+  registrationId: ''
+})
 
-const canSend = computed(() => draft.value.trim() !== '' && busy.value === false)
+const sessions = ref([])
+const activeChatId = ref('')
+const conversation = ref([])
+const draft = ref('')
+const requestBusy = ref(false)
+const error = ref('')
+
+const canSend = computed(() => {
+  return (
+    authState.value === 'signed-in' &&
+    registrationGate.state === 'ready' &&
+    requestBusy.value === false &&
+    draft.value.trim() !== '' &&
+    activeChatId.value.trim() !== ''
+  )
+})
+
+const activeLogo = computed(() => (currentTheme.value === 'dark' ? craftsmanLogoWhite : craftsmanLogo))
+
+const sortedSessions = computed(() => {
+  return [...sessions.value].sort((a, b) => {
+    const aTs = Date.parse(a.lastMessageAt || '') || 0
+    const bTs = Date.parse(b.lastMessageAt || '') || 0
+    return bTs - aTs
+  })
+})
 
 function uuid() {
   if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
     return crypto.randomUUID()
   }
-  return `run-${Date.now()}`
+  return `id-${Date.now()}`
 }
 
-function pushMessage(role, text) {
-  conversation.value.push({ id: crypto.randomUUID(), role, text })
+function parseJsonSafe(raw) {
+  if (typeof raw !== 'string') {
+    return raw
+  }
+  const trimmed = raw.trim()
+  if (trimmed === '') {
+    return ''
+  }
+  try {
+    return JSON.parse(trimmed)
+  } catch (_error) {
+    return raw
+  }
+}
+
+function readCookie(name) {
+  if (typeof document === 'undefined') {
+    return ''
+  }
+  const rows = document.cookie.split(';')
+  for (const row of rows) {
+    const [rawName, ...rest] = row.split('=')
+    if (rawName.trim() === name) {
+      return decodeURIComponent(rest.join('='))
+    }
+  }
+  return ''
+}
+
+function csrfTokenFromCookies() {
+  const candidates = ['sf_csrf_token', 'csrf_cookie', 'csrf_token', 'csrfToken']
+  for (const item of candidates) {
+    const value = readCookie(item).trim()
+    if (value !== '') {
+      return value
+    }
+  }
+  return ''
+}
+
+function normalizeError(parsed, response) {
+  if (typeof parsed === 'string' && parsed.trim() !== '') {
+    return parsed
+  }
+  if (parsed && typeof parsed === 'object') {
+    if (typeof parsed.error === 'string' && parsed.error.trim() !== '') {
+      return parsed.error
+    }
+    if (typeof parsed.detail === 'string' && parsed.detail.trim() !== '') {
+      return parsed.detail
+    }
+    if (typeof parsed.message === 'string' && parsed.message.trim() !== '') {
+      return parsed.message
+    }
+  }
+  return response.statusText || 'Request failed'
+}
+
+async function requestControlPlane(path, options = {}) {
+  const method = options.method || 'GET'
+  const body = options.body
+  const headers = { ...(options.headers || {}) }
+  const token = accessToken.value.trim()
+  const url = `${controlPlaneBaseUrl.value.replace(/\/$/, '')}${path}`
+
+  if (options.requiresAuth !== false && token !== '') {
+    headers.Authorization = `Bearer ${token}`
+  }
+
+  const isMutation = method !== 'GET' && method !== 'HEAD'
+  if (isMutation) {
+    const csrf = csrfTokenFromCookies()
+    if (csrf !== '' && headers['X-CSRF-Token'] === undefined) {
+      headers['X-CSRF-Token'] = csrf
+    }
+  }
+
+  let payload
+  if (body !== undefined) {
+    headers['Content-Type'] = 'application/json'
+    payload = JSON.stringify(body)
+  }
+
+  const response = await fetch(url, {
+    method,
+    credentials: 'include',
+    headers,
+    body: payload
+  })
+
+  const raw = await response.text()
+  const parsed = parseJsonSafe(raw)
+  if (!response.ok) {
+    if (response.status === 401) {
+      clearLocalSession('Session expired. Sign in again.')
+    }
+    throw new Error(normalizeError(parsed, response))
+  }
+  return parsed
+}
+
+function applyTheme(nextTheme) {
+  const normalized = nextTheme === 'light' ? 'light' : 'dark'
+  currentTheme.value = normalized
+  document.documentElement.setAttribute('data-theme', normalized)
+}
+
+function toggleTheme() {
+  const next = currentTheme.value === 'dark' ? 'light' : 'dark'
+  applyTheme(next)
+  window.localStorage.setItem(themeStorageKey, next)
+}
+
+function initializeTheme() {
+  const stored = window.localStorage.getItem(themeStorageKey)
+  if (stored === 'light' || stored === 'dark') {
+    applyTheme(stored)
+    return
+  }
+  const prefersLight = window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches
+  applyTheme(prefersLight ? 'light' : 'dark')
+}
+
+function clearLocalSession(notice = 'Signed out.') {
+  accessToken.value = ''
+  me.value = null
+  sessions.value = []
+  activeChatId.value = ''
+  conversation.value = []
+  registrationGate.state = 'unknown'
+  registrationGate.message = 'Sign in to validate runtime registration.'
+  registrationGate.registrationId = ''
+  authState.value = 'signed-out'
+  authNotice.value = notice
+  clearAccessToken()
+}
+
+function readUserId() {
+  if (!me.value || typeof me.value !== 'object') {
+    return ''
+  }
+  const candidates = [me.value.id, me.value.user_id, me.value.userId]
+  for (const item of candidates) {
+    if (typeof item === 'string' && item.trim() !== '') {
+      return item.trim()
+    }
+  }
+  return ''
+}
+
+function readOrgId() {
+  if (!me.value || typeof me.value !== 'object') {
+    return 'local-org'
+  }
+  const candidates = [me.value.organization_id, me.value.organizationId]
+  for (const item of candidates) {
+    if (typeof item === 'string' && item.trim() !== '') {
+      return item.trim()
+    }
+  }
+  return 'local-org'
+}
+
+function pushConversationMessage(role, text, messageId = uuid()) {
+  conversation.value.push({
+    id: uuid(),
+    role,
+    text,
+    messageId,
+    createdAt: new Date().toISOString()
+  })
 }
 
 function parseReply(payload) {
@@ -43,245 +243,900 @@ function parseReply(payload) {
       return payload.reply
     }
   }
-  return JSON.stringify(payload, null, 2)
+  if (typeof payload === 'string') {
+    return payload
+  }
+  try {
+    return JSON.stringify(payload, null, 2)
+  } catch (_error) {
+    return 'No assistant reply returned.'
+  }
+}
+
+function parseContentText(rawContent) {
+  if (typeof rawContent === 'string') {
+    const parsed = parseJsonSafe(rawContent)
+    if (parsed && typeof parsed === 'object') {
+      if (typeof parsed.text === 'string' && parsed.text.trim() !== '') {
+        return parsed.text
+      }
+      if (typeof parsed.message === 'string' && parsed.message.trim() !== '') {
+        return parsed.message
+      }
+    }
+    return rawContent
+  }
+
+  if (rawContent && typeof rawContent === 'object') {
+    if (typeof rawContent.text === 'string' && rawContent.text.trim() !== '') {
+      return rawContent.text
+    }
+    if (typeof rawContent.message === 'string' && rawContent.message.trim() !== '') {
+      return rawContent.message
+    }
+  }
+
+  return ''
+}
+
+function normalizeStatus(item) {
+  const candidates = [item?.status, item?.Status]
+  for (const value of candidates) {
+    if (typeof value === 'string' && value.trim() !== '') {
+      return value.trim().toLowerCase()
+    }
+  }
+  return ''
+}
+
+function normalizeSession(item) {
+  return {
+    chatId: item?.chat_id || item?.chatId || item?.ChatID || '',
+    title: item?.title || item?.Title || 'Untitled chat',
+    lastMessageAt: item?.last_message_at || item?.lastMessageAt || item?.LastMessageAt || new Date().toISOString(),
+    status: normalizeStatus(item)
+  }
+}
+
+async function fetchMe() {
+  const payload = await requestControlPlane('/v1/me', { method: 'GET' })
+  me.value = payload
+}
+
+async function preflightRegistration() {
+  if (authState.value !== 'signed-in') {
+    registrationGate.state = 'unknown'
+    registrationGate.message = 'Sign in to validate runtime registration.'
+    registrationGate.registrationId = ''
+    return
+  }
+
+  const trimmedAgentId = agentId.value.trim()
+  const trimmedVersion = agentVersion.value.trim()
+  if (trimmedAgentId === '' || trimmedVersion === '') {
+    registrationGate.state = 'missing'
+    registrationGate.message = 'Set both agent id and version before sending chat turns.'
+    registrationGate.registrationId = ''
+    return
+  }
+
+  registrationGate.state = 'checking'
+  registrationGate.message = 'Checking runtime registration status...'
+  registrationGate.registrationId = ''
+
+  try {
+    const response = await requestControlPlane(
+      `/v1/runtime/registrations?agent_id=${encodeURIComponent(trimmedAgentId)}&agent_version=${encodeURIComponent(trimmedVersion)}`,
+      { method: 'GET' }
+    )
+    const registrations = Array.isArray(response?.registrations) ? response.registrations : []
+    const active = registrations.find((item) => normalizeStatus(item) === 'active')
+
+    if (!active) {
+      if (registrations.length === 0) {
+        registrationGate.state = 'missing'
+        registrationGate.message = 'No registration found. Create, validate, and activate runtime registration in control plane.'
+      } else {
+        registrationGate.state = 'inactive'
+        registrationGate.message = 'Registration exists but is not active. Activate registration before sending.'
+      }
+      registrationGate.registrationId = ''
+      return
+    }
+
+    registrationGate.state = 'ready'
+    registrationGate.message = 'Active runtime registration found. Chat is enabled.'
+    registrationGate.registrationId = active.id || active.ID || ''
+  } catch (requestError) {
+    const message = requestError instanceof Error ? requestError.message : 'Registration preflight failed.'
+    if (message.toLowerCase().includes('unauthorized')) {
+      registrationGate.state = 'unauthorized'
+      registrationGate.message = 'Unauthorized session. Sign in again.'
+    } else {
+      registrationGate.state = 'error'
+      registrationGate.message = message
+    }
+  }
+}
+
+function upsertSession(chatId, title, timestamp) {
+  const trimmed = chatId.trim()
+  if (trimmed === '') {
+    return
+  }
+  const idx = sessions.value.findIndex((item) => item.chatId === trimmed)
+  if (idx < 0) {
+    sessions.value.push({
+      chatId: trimmed,
+      title: title.trim() || 'Untitled chat',
+      status: 'active',
+      lastMessageAt: timestamp
+    })
+    return
+  }
+  sessions.value[idx] = {
+    ...sessions.value[idx],
+    title: sessions.value[idx].title || title.trim() || 'Untitled chat',
+    lastMessageAt: timestamp,
+    status: 'active'
+  }
+}
+
+async function loadSessions() {
+  const userId = readUserId()
+  const trimmedAgentId = agentId.value.trim()
+  if (userId === '' || trimmedAgentId === '') {
+    sessions.value = []
+    activeChatId.value = ''
+    return
+  }
+
+  const payload = await requestControlPlane(
+    `/v1/chat/history/sessions?agent_id=${encodeURIComponent(trimmedAgentId)}&user_id=${encodeURIComponent(userId)}&status=active&limit=50`,
+    { method: 'GET' }
+  )
+  const items = Array.isArray(payload?.sessions) ? payload.sessions.map(normalizeSession) : []
+  sessions.value = items.filter((item) => item.chatId !== '')
+  if (sessions.value.length > 0 && activeChatId.value.trim() === '') {
+    activeChatId.value = sessions.value[0].chatId
+  }
+}
+
+async function loadHistory(chatId) {
+  const userId = readUserId()
+  const trimmedAgentId = agentId.value.trim()
+  const trimmedChatId = chatId.trim()
+  if (userId === '' || trimmedAgentId === '' || trimmedChatId === '') {
+    conversation.value = []
+    return
+  }
+
+  const payload = await requestControlPlane(
+    `/v1/chat/history/messages?agent_id=${encodeURIComponent(trimmedAgentId)}&chat_id=${encodeURIComponent(trimmedChatId)}&user_id=${encodeURIComponent(userId)}&limit=200`,
+    { method: 'GET' }
+  )
+  const messages = Array.isArray(payload?.messages) ? payload.messages : []
+
+  conversation.value = messages.map((item) => {
+    return {
+      id: uuid(),
+      role: item?.role || item?.Role || 'assistant',
+      text: parseContentText(item?.content || item?.Content),
+      messageId: item?.message_id || item?.messageId || item?.MessageID || uuid(),
+      createdAt: item?.created_at || item?.createdAt || item?.CreatedAt || new Date().toISOString()
+    }
+  })
+
+  if (conversation.value.length === 0) {
+    pushConversationMessage('assistant', 'New chat session ready. Describe the HR scenario to draft a response.')
+  }
+}
+
+async function selectSession(chatId) {
+  activeChatId.value = chatId
+  error.value = ''
+  await loadHistory(chatId)
+}
+
+function createSession() {
+  const chatId = uuid()
+  activeChatId.value = chatId
+  conversation.value = []
+  pushConversationMessage('assistant', 'New chat session ready. Describe the HR scenario to draft a response.')
+  upsertSession(chatId, 'New conversation', new Date().toISOString())
+}
+
+async function persistHistoryMessage({ chatId, messageId, role, text, runId }) {
+  const userId = readUserId()
+  await requestControlPlane('/v1/chat/history/messages', {
+    method: 'POST',
+    body: {
+      agent_id: agentId.value.trim(),
+      chat_id: chatId,
+      message_id: messageId,
+      user_id: userId,
+      role,
+      content: {
+        text,
+        message: text,
+        run_id: runId,
+        chat_id: chatId,
+        agent_id: agentId.value.trim(),
+        organization_id: readOrgId()
+      },
+      metadata: {
+        run_id: runId,
+        chat_id: chatId,
+        agent_id: agentId.value.trim(),
+        organization_id: readOrgId(),
+        role
+      }
+    }
+  })
+}
+
+async function patchHistoryMessage(messageId, { chatId, runId, role, text }) {
+  const userId = readUserId()
+  await requestControlPlane(`/v1/chat/history/messages/${encodeURIComponent(messageId)}`, {
+    method: 'PATCH',
+    body: {
+      agent_id: agentId.value.trim(),
+      chat_id: chatId,
+      user_id: userId,
+      content: {
+        text,
+        message: text,
+        run_id: runId,
+        chat_id: chatId,
+        agent_id: agentId.value.trim(),
+        organization_id: readOrgId()
+      },
+      metadata: {
+        run_id: runId,
+        chat_id: chatId,
+        role,
+        invoke_status: 'completed'
+      }
+    }
+  })
+}
+
+function buildInvokeMessages(nextUserText) {
+  const historyTurns = conversation.value
+    .filter((item) => item.role === 'user' || item.role === 'assistant')
+    .map((item) => ({ role: item.role, content: item.text }))
+  historyTurns.push({ role: 'user', content: nextUserText })
+  return historyTurns.slice(-20)
 }
 
 async function sendMessage() {
   const text = draft.value.trim()
-  if (text === '' || busy.value) {
+  if (text === '' || requestBusy.value) {
     return
   }
 
-  error.value = ''
-  pushMessage('user', text)
-  draft.value = ''
-  busy.value = true
-
-  const body = {
-    schema_version: 'v1',
-    run_id: uuid(),
-    agent_id: agentId.value.trim(),
-    agent_version: agentVersion.value.trim(),
-    mode: 'realtime',
-    trace: {
-      trace_id: `trace-${Date.now()}`,
-      span_id: `span-${Date.now()}`,
-      tenant_id: tenantId.value.trim()
-    },
-    input: { message: text },
-    deadline_ms: 0,
-    idempotency_key: uuid()
+  if (registrationGate.state !== 'ready') {
+    error.value = registrationGate.message
+    return
   }
+
+  const chatId = activeChatId.value.trim()
+  if (chatId === '') {
+    error.value = 'Create or select a chat session first.'
+    return
+  }
+
+  const runId = uuid()
+  const userMessageId = uuid()
+  const assistantMessageId = uuid()
+  const now = Date.now()
+
+  error.value = ''
+  requestBusy.value = true
+  draft.value = ''
+  pushConversationMessage('user', text, userMessageId)
 
   try {
-    const headers = { 'content-type': 'application/json' }
-    if (invokeToken.value.trim() !== '') {
-      headers.authorization = `Bearer ${invokeToken.value.trim()}`
+    await persistHistoryMessage({ chatId, messageId: userMessageId, role: 'user', text, runId })
+
+    const invokePayload = {
+      schema_version: 'v1',
+      run_id: runId,
+      agent_id: agentId.value.trim(),
+      agent_version: agentVersion.value.trim(),
+      mode: 'realtime',
+      trace: {
+        trace_id: `trace-${now}`,
+        span_id: `span-${now}`,
+        tenant_id: readOrgId()
+      },
+      input: {
+        message: text,
+        chat_id: chatId,
+        messages: buildInvokeMessages(text)
+      },
+      deadline_ms: 0,
+      idempotency_key: `invoke-${runId}`
     }
 
-    const response = await fetch(`${runtimeBaseUrl.value.replace(/\/$/, '')}/invoke`, {
+    const invokeResult = await requestControlPlane('/v1/runtime/invoke', {
       method: 'POST',
-      headers,
-      body: JSON.stringify(body)
+      body: invokePayload
     })
 
-    const raw = await response.text()
-    let parsed = raw
-    try {
-      parsed = JSON.parse(raw)
-    } catch (_e) {
-      parsed = raw
-    }
+    const reply = parseReply(invokeResult)
+    pushConversationMessage('assistant', reply, assistantMessageId)
 
-    if (!response.ok) {
-      throw new Error(typeof parsed === 'string' ? parsed : JSON.stringify(parsed, null, 2))
-    }
+    await persistHistoryMessage({
+      chatId,
+      messageId: assistantMessageId,
+      role: 'assistant',
+      text: reply,
+      runId
+    })
+    await patchHistoryMessage(userMessageId, {
+      chatId,
+      runId,
+      role: 'user',
+      text
+    })
 
-    pushMessage('assistant', parseReply(parsed))
-  } catch (e) {
-    const message = e instanceof Error ? e.message : 'Invoke failed'
+    upsertSession(chatId, text.slice(0, 72), new Date().toISOString())
+  } catch (requestError) {
+    const message = requestError instanceof Error ? requestError.message : 'Chat request failed.'
     error.value = message
-    pushMessage('assistant', `I could not complete that request.\n\n${message}`)
+    pushConversationMessage('assistant', `I could not complete that request.\n\n${message}`)
   } finally {
-    busy.value = false
+    requestBusy.value = false
   }
 }
+
+async function signIn() {
+  if (authBusy.value) {
+    return
+  }
+  authBusy.value = true
+  authState.value = 'signing-in'
+  authNotice.value = 'Signing in...'
+  error.value = ''
+
+  try {
+    const payload = await requestControlPlane('/v1/auth/sessions', {
+      method: 'POST',
+      requiresAuth: false,
+      body: {
+        email: email.value.trim(),
+        password: password.value
+      }
+    })
+
+    const token =
+      payload?.access_token ||
+      payload?.accessToken ||
+      payload?.token ||
+      ''
+    if (typeof token !== 'string' || token.trim() === '') {
+      throw new Error('Sign-in succeeded but no access token returned.')
+    }
+
+    accessToken.value = token.trim()
+    storeAccessToken(accessToken.value)
+    await fetchMe()
+    await preflightRegistration()
+    await loadSessions()
+    if (activeChatId.value.trim() !== '') {
+      await loadHistory(activeChatId.value)
+    } else {
+      createSession()
+    }
+    authState.value = 'signed-in'
+    authNotice.value = 'Signed in. Control-plane chat is ready.'
+  } catch (requestError) {
+    const message = requestError instanceof Error ? requestError.message : 'Sign-in failed.'
+    clearLocalSession(message)
+    error.value = message
+  } finally {
+    authBusy.value = false
+  }
+}
+
+async function signOut() {
+  if (authBusy.value) {
+    return
+  }
+  authBusy.value = true
+  try {
+    await requestControlPlane('/v1/auth/sessions/current', { method: 'DELETE' })
+  } catch (_error) {
+    // Ignore logout request failures and clear local state anyway.
+  } finally {
+    clearLocalSession('Signed out.')
+    authBusy.value = false
+  }
+}
+
+watch([agentId, agentVersion], async () => {
+  if (authState.value === 'signed-in') {
+    await preflightRegistration()
+    await loadSessions()
+    if (activeChatId.value.trim() !== '') {
+      await loadHistory(activeChatId.value)
+    }
+  }
+})
+
+onMounted(async () => {
+  initializeTheme()
+  const envToken = typeof import.meta.env.VITE_CONTROL_PLANE_TOKEN === 'string'
+    ? import.meta.env.VITE_CONTROL_PLANE_TOKEN.trim()
+    : ''
+  const cachedToken = readAccessToken()
+  accessToken.value = cachedToken || envToken
+  if (accessToken.value === '') {
+    clearLocalSession('Sign in to use control-plane invoke and chat history.')
+    return
+  }
+
+  authState.value = 'signing-in'
+  authNotice.value = 'Restoring session...'
+  try {
+    await fetchMe()
+    authState.value = 'signed-in'
+    authNotice.value = 'Session restored.'
+    await preflightRegistration()
+    await loadSessions()
+    if (activeChatId.value.trim() !== '') {
+      await loadHistory(activeChatId.value)
+    } else {
+      createSession()
+    }
+  } catch (_error) {
+    clearLocalSession('Stored session is invalid. Sign in again.')
+  }
+})
 </script>
 
 <template>
-  <main class="chat-shell">
-    <header class="chat-header">
-      <div>
-        <p class="kicker">SimpleFlow HR Agent System</p>
-        <h1>HR Chat</h1>
+  <main class="shell">
+    <header class="topbar">
+      <div class="brand-block">
+        <img class="brand-logo" :src="activeLogo" alt="CraftsmanLabs logo" />
+        <div>
+          <p class="eyebrow">SimpleFlow HR Agent System</p>
+          <h1>Control-Plane Chat</h1>
+        </div>
       </div>
-      <button type="button" class="ghost" @click="showConfig = !showConfig">
-        {{ showConfig ? 'Hide Settings' : 'Settings' }}
-      </button>
+      <div class="topbar-actions">
+        <button type="button" class="btn ghost" @click="toggleTheme">
+          {{ currentTheme === 'dark' ? 'Light Mode' : 'Dark Mode' }}
+        </button>
+        <button type="button" class="btn ghost" @click="showConfig = !showConfig">
+          {{ showConfig ? 'Hide Settings' : 'Settings' }}
+        </button>
+      </div>
     </header>
 
-    <section v-if="showConfig" class="config">
+    <section class="status-row">
+      <article class="pill" :class="`pill-${authState}`">
+        <strong>Session:</strong> {{ authState }}
+      </article>
+      <article class="pill" :class="`pill-${registrationGate.state}`">
+        <strong>Registration:</strong> {{ registrationGate.state }}
+      </article>
+      <article class="notice">{{ authNotice }}</article>
+    </section>
+
+    <section v-if="showConfig" class="panel config-panel">
       <label>
-        Runtime Base URL
-        <input v-model="runtimeBaseUrl" type="text" />
+        Control Plane Base URL
+        <input v-model="controlPlaneBaseUrl" type="text" />
       </label>
       <label>
         Agent ID
-        <input v-model="agentId" type="text" />
+        <input v-model="agentId" type="text" placeholder="agent_..." />
       </label>
       <label>
         Agent Version
-        <input v-model="agentVersion" type="text" />
+        <input v-model="agentVersion" type="text" placeholder="v1" />
       </label>
-      <label>
-        Tenant ID
-        <input v-model="tenantId" type="text" />
-      </label>
-      <label>
-        Invoke Bearer Token (optional)
-        <input v-model="invokeToken" type="password" />
-      </label>
+      <button type="button" class="btn" :disabled="authState !== 'signed-in'" @click="preflightRegistration">
+        Recheck Registration
+      </button>
     </section>
 
-    <section class="messages">
-      <article v-for="msg in conversation" :key="msg.id" class="bubble" :class="msg.role">
-        <strong>{{ msg.role === 'assistant' ? 'HR Agent' : 'You' }}</strong>
-        <pre>{{ msg.text }}</pre>
-      </article>
-    </section>
-
-    <footer class="composer">
-      <textarea
-        v-model="draft"
-        rows="3"
-        placeholder="Describe the HR issue and ask for draft email..."
-        @keydown.enter.exact.prevent="sendMessage"
-      />
-      <div class="composer-actions">
-        <p v-if="error !== ''" class="error">{{ error }}</p>
-        <button type="button" :disabled="!canSend" @click="sendMessage">
-          {{ busy ? 'Sending...' : 'Send' }}
+    <section v-if="authState !== 'signed-in'" class="panel auth-panel">
+      <h2>Sign in required</h2>
+      <p>Chat is disabled until you authenticate and an active runtime registration is found.</p>
+      <div class="auth-grid">
+        <label>
+          Email
+          <input v-model="email" type="email" autocomplete="username" />
+        </label>
+        <label>
+          Password
+          <input v-model="password" type="password" autocomplete="current-password" />
+        </label>
+      </div>
+      <div class="auth-actions">
+        <button type="button" class="btn" :disabled="authBusy" @click="signIn">
+          {{ authBusy ? 'Signing in...' : 'Sign In' }}
         </button>
       </div>
-    </footer>
+    </section>
+
+    <section v-else class="layout">
+      <aside class="panel sessions-panel">
+        <div class="sessions-head">
+          <h2>Sessions</h2>
+          <button type="button" class="btn" @click="createSession">New</button>
+        </div>
+        <p class="help">Each session uses one stable <code>chat_id</code> for all turns.</p>
+        <div class="sessions-list">
+          <button
+            v-for="item in sortedSessions"
+            :key="item.chatId"
+            type="button"
+            class="session-item"
+            :class="{ active: item.chatId === activeChatId }"
+            @click="selectSession(item.chatId)"
+          >
+            <strong>{{ item.title || 'Untitled chat' }}</strong>
+            <span>{{ item.chatId }}</span>
+          </button>
+        </div>
+      </aside>
+
+      <section class="panel chat-panel">
+        <header class="chat-panel-head">
+          <div>
+            <h2>HR Chat</h2>
+            <p class="help">Chat invoke always goes through <code>POST /v1/runtime/invoke</code>.</p>
+          </div>
+          <button type="button" class="btn ghost" @click="signOut">Sign Out</button>
+        </header>
+
+        <p class="gate-message">{{ registrationGate.message }}</p>
+
+        <section class="messages">
+          <article v-for="msg in conversation" :key="msg.id" class="bubble" :class="msg.role">
+            <strong>{{ msg.role === 'assistant' ? 'HR Agent' : 'You' }}</strong>
+            <pre>{{ msg.text }}</pre>
+          </article>
+        </section>
+
+        <footer class="composer">
+          <textarea
+            v-model="draft"
+            rows="3"
+            placeholder="Describe the HR issue and ask for a warning email draft..."
+            :disabled="registrationGate.state !== 'ready' || requestBusy"
+            @keydown.enter.exact.prevent="sendMessage"
+          />
+          <div class="composer-actions">
+            <p v-if="error !== ''" class="error">{{ error }}</p>
+            <button type="button" class="btn" :disabled="!canSend" @click="sendMessage">
+              {{ requestBusy ? 'Sending...' : 'Send' }}
+            </button>
+          </div>
+        </footer>
+      </section>
+    </section>
   </main>
 </template>
 
 <style scoped>
+:global(:root) {
+  color-scheme: light;
+}
+
+:global(:root[data-theme='dark']) {
+  color-scheme: dark;
+}
+
 :global(body) {
   margin: 0;
-  background: linear-gradient(140deg, #f4f7fb 0%, #eef5ff 100%);
-  color: #10243f;
+  font-family: 'IBM Plex Sans', 'Segoe UI', sans-serif;
+  background:
+    radial-gradient(1200px 560px at 8% 0%, rgba(226, 126, 90, 0.24), transparent 60%),
+    radial-gradient(760px 540px at 90% 8%, rgba(91, 118, 160, 0.22), transparent 55%),
+    var(--bg);
+  color: var(--text);
 }
 
-.chat-shell {
-  width: min(960px, calc(100vw - 2rem));
-  margin: 1.2rem auto;
+:global(:root[data-theme='dark'] body) {
+  --bg: #141a23;
+  --panel: rgba(20, 29, 41, 0.9);
+  --panel-soft: rgba(27, 38, 54, 0.88);
+  --line: rgba(221, 226, 236, 0.17);
+  --text: #f2f4f8;
+  --muted: #b5becc;
+  --accent: #d87a4f;
+  --accent-ghost: rgba(216, 122, 79, 0.18);
+  --danger: #f49b86;
+}
+
+:global(:root[data-theme='light'] body) {
+  --bg: #f4efe7;
+  --panel: rgba(255, 253, 250, 0.92);
+  --panel-soft: rgba(250, 246, 239, 0.88);
+  --line: rgba(30, 45, 68, 0.16);
+  --text: #1f2d42;
+  --muted: #5e6a7b;
+  --accent: #b55f35;
+  --accent-ghost: rgba(181, 95, 53, 0.13);
+  --danger: #b13838;
+}
+
+.shell {
+  width: min(1180px, calc(100vw - 2rem));
+  margin: 1rem auto;
   display: grid;
   gap: 0.9rem;
-  font-family: 'Chivo', 'Trebuchet MS', sans-serif;
 }
 
-.chat-header,
-.config,
-.messages,
-.composer {
-  background: rgba(255, 255, 255, 0.9);
-  border: 1px solid rgba(16, 36, 63, 0.14);
+.panel {
+  border: 1px solid var(--line);
   border-radius: 14px;
-  padding: 0.9rem;
+  background: var(--panel);
+  backdrop-filter: blur(4px);
 }
 
-.chat-header {
+.topbar {
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  background: color-mix(in srgb, var(--panel) 88%, transparent);
+  padding: 0.9rem;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+}
+
+.brand-block {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+}
+
+.brand-logo {
+  width: 44px;
+  height: 44px;
+}
+
+.eyebrow {
+  margin: 0;
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.09em;
+  color: var(--muted);
+}
+
+h1,
+h2 {
+  margin: 0;
+}
+
+h1 {
+  font-size: 1.35rem;
+}
+
+.topbar-actions {
+  display: flex;
+  gap: 0.5rem;
+}
+
+.status-row {
+  display: grid;
+  gap: 0.6rem;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.pill,
+.notice {
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 0.55rem 0.7rem;
+  background: var(--panel-soft);
+  font-size: 0.85rem;
+}
+
+.pill-ready,
+.pill-signed-in {
+  border-color: color-mix(in srgb, var(--line) 45%, #3aa26f 55%);
+}
+
+.pill-missing,
+.pill-inactive,
+.pill-error,
+.pill-unauthorized {
+  border-color: color-mix(in srgb, var(--line) 45%, var(--danger) 55%);
+}
+
+.config-panel,
+.auth-panel {
+  padding: 0.9rem;
+  display: grid;
+  gap: 0.7rem;
+}
+
+.auth-grid,
+.config-panel {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+label {
+  display: grid;
+  gap: 0.3rem;
+  font-size: 0.85rem;
+  font-weight: 600;
+}
+
+input,
+textarea {
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 0.6rem 0.65rem;
+  font: inherit;
+  background: color-mix(in srgb, var(--panel) 92%, transparent);
+  color: var(--text);
+}
+
+.layout {
+  display: grid;
+  grid-template-columns: 280px minmax(0, 1fr);
+  gap: 0.8rem;
+}
+
+.sessions-panel,
+.chat-panel {
+  padding: 0.8rem;
+}
+
+.sessions-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.help,
+.gate-message {
+  margin: 0.35rem 0;
+  color: var(--muted);
+  font-size: 0.82rem;
+}
+
+.sessions-list {
+  display: grid;
+  gap: 0.5rem;
+  max-height: 62vh;
+  overflow: auto;
+  margin-top: 0.65rem;
+}
+
+.session-item {
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--panel-soft);
+  color: var(--text);
+  text-align: left;
+  padding: 0.55rem;
+  display: grid;
+  gap: 0.2rem;
+  cursor: pointer;
+}
+
+.session-item span {
+  color: var(--muted);
+  font-size: 0.72rem;
+}
+
+.session-item.active {
+  border-color: var(--accent);
+  background: var(--accent-ghost);
+}
+
+.chat-panel {
+  display: grid;
+  gap: 0.65rem;
+}
+
+.chat-panel-head {
   display: flex;
   justify-content: space-between;
   align-items: center;
-}
-
-.kicker {
-  margin: 0;
-  font-size: 0.75rem;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
-  color: #3d5f90;
-}
-
-h1 { margin: 0.2rem 0 0; }
-
-.config {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 0.6rem;
 }
 
-label { display: grid; gap: 0.25rem; font-weight: 600; font-size: 0.9rem; }
-input, textarea {
-  font: inherit;
-  border: 1px solid rgba(16, 36, 63, 0.2);
-  border-radius: 10px;
-  padding: 0.6rem 0.7rem;
-}
-
 .messages {
-  min-height: 52vh;
-  max-height: 62vh;
+  min-height: 48vh;
+  max-height: 60vh;
   overflow: auto;
   display: grid;
   gap: 0.65rem;
 }
 
 .bubble {
-  max-width: 82%;
-  padding: 0.65rem;
+  max-width: 84%;
+  border: 1px solid var(--line);
   border-radius: 10px;
-  border: 1px solid rgba(16, 36, 63, 0.12);
-  background: #f5f8fd;
+  padding: 0.65rem;
+  background: color-mix(in srgb, var(--panel-soft) 85%, transparent);
 }
 
 .bubble.user {
   margin-left: auto;
-  background: #dfeaff;
+  background: color-mix(in srgb, var(--accent-ghost) 75%, var(--panel-soft) 25%);
 }
 
 .bubble.assistant {
   margin-right: auto;
-  background: #f6fbf2;
 }
 
 pre {
-  margin: 0.3rem 0 0;
+  margin: 0.35rem 0 0;
   white-space: pre-wrap;
-  font-family: 'IBM Plex Mono', monospace;
+  font-family: 'IBM Plex Mono', 'Consolas', monospace;
   font-size: 0.82rem;
 }
 
-.composer { display: grid; gap: 0.5rem; }
+.composer {
+  display: grid;
+  gap: 0.5rem;
+}
 
-.composer-actions {
+.composer-actions,
+.auth-actions {
   display: flex;
   justify-content: space-between;
   align-items: center;
 }
 
-button {
-  border: 0;
+.btn {
+  border: 1px solid var(--accent);
   border-radius: 999px;
-  padding: 0.55rem 1rem;
+  padding: 0.5rem 0.9rem;
+  font: inherit;
+  font-weight: 600;
+  color: #fff;
+  background: var(--accent);
   cursor: pointer;
-  color: white;
-  background: #1f62da;
 }
 
-.ghost {
+.btn.ghost {
+  color: var(--text);
+  border-color: var(--line);
   background: transparent;
-  border: 1px solid rgba(16, 36, 63, 0.3);
-  color: #163664;
 }
 
-.error { margin: 0; color: #8b1f1f; font-weight: 600; font-size: 0.85rem; }
+.btn:disabled {
+  opacity: 0.62;
+  cursor: not-allowed;
+}
 
-@media (max-width: 860px) {
-  .config { grid-template-columns: minmax(0, 1fr); }
-  .bubble { max-width: 95%; }
+.error {
+  margin: 0;
+  color: var(--danger);
+  font-weight: 600;
+  font-size: 0.86rem;
+}
+
+@media (max-width: 960px) {
+  .status-row,
+  .auth-grid,
+  .config-panel {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .layout {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .messages {
+    max-height: 52vh;
+  }
+
+  .bubble {
+    max-width: 96%;
+  }
 }
 </style>

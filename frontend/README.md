@@ -1,6 +1,6 @@
 # Vue Frontend Shell
 
-Shared frontend shell for remote runtime integrations.
+Control-plane-required HR chat shell.
 
 ## Run
 
@@ -11,14 +11,22 @@ npm run dev
 
 ## Environment
 
-- `VITE_RUNTIME_BASE_URL` (default: `http://localhost:8091`)
 - `VITE_CONTROL_PLANE_BASE_URL` (default: `http://localhost:8080`)
-- `VITE_CONTROL_PLANE_TOKEN` (optional)
+- `VITE_CONTROL_PLANE_TOKEN` (optional preseed token)
+- `VITE_AGENT_ID` (required for registration preflight and chat)
+- `VITE_AGENT_VERSION` (default: `v1`)
 
 Copy `.env.example` to `.env` and adjust values as needed.
 
-## Included UIs
+## Included behavior
 
-- Runtime Studio (`GET /health`, `GET /meta`, `POST /invoke`)
-- Event Sandbox (`POST /webhook`, `POST /queue/enqueue`, `POST /queue/process`)
-- Registration Lifecycle (`POST /v1/runtime/registrations/{id}/validate|activate|deactivate`)
+- Sign-in/sign-out against control-plane auth session APIs
+- Registration preflight gate using `GET /v1/runtime/registrations`
+- Chat invoke via `POST /v1/runtime/invoke`
+- Chat sessions + history via:
+  - `GET /v1/chat/history/sessions`
+  - `GET /v1/chat/history/messages`
+  - `POST /v1/chat/history/messages`
+  - `PATCH /v1/chat/history/messages/{message_id}`
+
+Direct browser calls to runtime `/invoke` are intentionally removed from the chat path.
