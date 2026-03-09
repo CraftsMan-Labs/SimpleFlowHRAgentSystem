@@ -20,7 +20,6 @@ from simpleflow_sdk import (
     ChatMessageWrite,
     InvokeTokenVerifier,
     QueueContract,
-    RuntimeEvent,
     SimpleFlowAuthenticationError,
     SimpleFlowAuthorizationError,
     SimpleFlowClient,
@@ -501,6 +500,19 @@ def _token_metrics_from_nerdstats(nerdstats: Any) -> dict[str, int]:
             metrics["prompt_tokens"] + metrics["completion_tokens"]
         )
     return metrics
+
+
+def _resolve_chat_id(input_payload: dict[str, Any], fallback_run_id: str) -> str:
+    for candidate in (
+        input_payload.get("chat_id"),
+        input_payload.get("chatId"),
+        input_payload.get("conversation_id"),
+        input_payload.get("conversationId"),
+    ):
+        chat_id = str(candidate).strip()
+        if chat_id != "":
+            return chat_id
+    return fallback_run_id
 
 
 def _build_workflow_registry() -> dict[str, str]:
@@ -1400,23 +1412,39 @@ def invoke(req: InvokeRequest, request: Request) -> dict[str, Any]:
     chat_message_metadata = _build_chat_message_metadata(req, workflow_result)
     nerdstats_payload = chat_message_metadata.get("nerdstats")
     token_metrics = _token_metrics_from_nerdstats(nerdstats_payload)
+    chat_id = _resolve_chat_id(req.input, scoped_run_id)
+    message_id = f"assistant-{uuid4().hex}"
+    event_idempotency_key = f"runtime-event-{scoped_run_id}"
+    chat_idempotency_key = f"runtime-chat-{message_id}"
     trace_context = chat_message_metadata.get("trace_context")
     trace_url = ""
     if isinstance(trace_context, dict):
         trace_url = str(trace_context.get("trace_url", "")).strip()
 
+    runtime_write_client: SimpleFlowClient | None = None
     if sdk_client is not None:
         try:
-            sdk_client.report_runtime_event(
-                RuntimeEvent(
-                    type="runtime.invoke.completed",
-                    agent_id=scoped_agent_id,
-                    agent_version=agent_version,
-                    run_id=scoped_run_id,
-                    organization_id=scoped_org_id,
-                    user_id=scoped_user_id if scoped_user_id != "" else None,
-                    timestamp_ms=now_ms,
-                    payload={
+            runtime_write_client = _build_control_plane_client(
+                request,
+                require_bearer=True,
+                allow_api_token_fallback=False,
+            )
+        except Exception:
+            runtime_write_client = sdk_client
+
+    if runtime_write_client is not None:
+        try:
+            runtime_write_client.write_event(
+                {
+                    "event_type": "runtime.invoke.completed",
+                    "agent_id": scoped_agent_id,
+                    "organization_id": scoped_org_id,
+                    "run_id": scoped_run_id,
+                    "trace_id": str(req.trace.trace_id).strip(),
+                    "conversation_id": chat_id,
+                    "request_id": str(req.trace.span_id).strip() or scoped_run_id,
+                    "idempotency_key": event_idempotency_key,
+                    "payload": {
                         "status": "ok",
                         "workflow_id": workflow_result.get("workflow_id"),
                         "terminal_node": workflow_result.get("terminal_node"),
@@ -1426,10 +1454,10 @@ def invoke(req: InvokeRequest, request: Request) -> dict[str, Any]:
                         "nerdstats": chat_message_metadata.get("nerdstats"),
                         "metrics": token_metrics,
                     },
-                )
+                }
             )
             write_from_workflow = getattr(
-                sdk_client, "write_chat_message_from_workflow_result", None
+                runtime_write_client, "write_chat_message_from_workflow_result", None
             )
             if callable(write_from_workflow):
                 write_from_workflow(
@@ -1441,22 +1469,33 @@ def invoke(req: InvokeRequest, request: Request) -> dict[str, Any]:
                     trace_id=str(req.trace.trace_id).strip(),
                     span_id=str(req.trace.span_id).strip(),
                     tenant_id=str(req.trace.tenant_id).strip(),
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    direction="outbound",
                     created_at_ms=now_ms,
+                    idempotency_key=chat_idempotency_key,
                 )
             else:
-                sdk_client.write_chat_message(
+                runtime_write_client.write_chat_message(
                     ChatMessageWrite(
                         agent_id=scoped_agent_id,
                         organization_id=scoped_org_id,
                         run_id=scoped_run_id,
+                        chat_id=chat_id,
+                        message_id=message_id,
                         role="assistant",
+                        direction="outbound",
                         content=chat_message_content,
                         metadata=chat_message_metadata,
+                        idempotency_key=chat_idempotency_key,
                         created_at_ms=now_ms,
                     )
                 )
         except Exception as exc:  # noqa: BLE001
             logger.warning("runtime SDK write skipped: %s", exc)
+        finally:
+            if runtime_write_client is not sdk_client:
+                runtime_write_client.close()
 
     return {
         "schema_version": "v1",
@@ -1474,7 +1513,6 @@ def invoke(req: InvokeRequest, request: Request) -> dict[str, Any]:
             "started_at_ms": now_ms,
             "finished_at_ms": int(time.time() * 1000),
             "duration_ms": 1,
-            **token_metrics,
         },
     }
 
