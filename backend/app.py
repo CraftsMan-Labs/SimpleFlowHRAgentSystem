@@ -10,6 +10,7 @@ from typing import Any
 
 import jwt
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 from simpleflow_sdk import (
@@ -66,6 +67,27 @@ logger = logging.getLogger("simpleflow.runtime.template")
 
 
 app = FastAPI(title="SimpleFlow Python Runtime Template")
+
+cors_allow_origins_raw = os.getenv(
+    "RUNTIME_CORS_ALLOW_ORIGINS",
+    "http://localhost:5175,http://localhost:5173",
+).strip()
+cors_allow_origins = [
+    origin.strip()
+    for origin in cors_allow_origins_raw.split(",")
+    if origin.strip() != ""
+]
+if len(cors_allow_origins) == 0:
+    cors_allow_origins = ["*"]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=cors_allow_origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 queue_buffer: deque[QueueMessage] = deque()
 
 agent_id = os.getenv("RUNTIME_AGENT_ID", "sample-python-runtime")
@@ -285,6 +307,18 @@ def _workflow_text_output(terminal_output: Any) -> str:
     return str(terminal_output)
 
 
+def _build_workflow_registry() -> dict[str, str]:
+    subgraph_path = workflow_root / "hr-warning-email-subgraph.yaml"
+    if not subgraph_path.exists():
+        return {}
+
+    resolved = str(subgraph_path)
+    return {
+        "hr_warning_email_subgraph": resolved,
+        "hr-warning-email-subgraph": resolved,
+    }
+
+
 def _run_agent_workflow(req: InvokeRequest) -> dict[str, Any]:
     if not workflow_path.exists():
         raise HTTPException(
@@ -296,6 +330,7 @@ def _run_agent_workflow(req: InvokeRequest) -> dict[str, Any]:
     workflow_input = {
         "messages": _build_workflow_messages(req.input),
         "email_text": str(req.input.get("message", "")).strip(),
+        "workflow_registry": _build_workflow_registry(),
     }
     workflow_options = {
         "trace": {"tenant": {"run_id": req.run_id}},
@@ -417,31 +452,34 @@ def invoke(req: InvokeRequest, request: Request) -> dict[str, Any]:
     terminal_output = _workflow_text_output(workflow_result.get("terminal_output"))
 
     if sdk_client is not None:
-        sdk_client.report_runtime_event(
-            RuntimeEvent(
-                type="runtime.invoke.completed",
-                agent_id=scoped_agent_id,
-                agent_version=agent_version,
-                run_id=scoped_run_id,
-                organization_id=scoped_org_id,
-                user_id=scoped_user_id if scoped_user_id != "" else None,
-                timestamp_ms=now_ms,
-                payload={
-                    "status": "ok",
-                    "workflow_id": workflow_result.get("workflow_id"),
-                },
+        try:
+            sdk_client.report_runtime_event(
+                RuntimeEvent(
+                    type="runtime.invoke.completed",
+                    agent_id=scoped_agent_id,
+                    agent_version=agent_version,
+                    run_id=scoped_run_id,
+                    organization_id=scoped_org_id,
+                    user_id=scoped_user_id if scoped_user_id != "" else None,
+                    timestamp_ms=now_ms,
+                    payload={
+                        "status": "ok",
+                        "workflow_id": workflow_result.get("workflow_id"),
+                    },
+                )
             )
-        )
-        sdk_client.write_chat_message(
-            ChatMessageWrite(
-                agent_id=scoped_agent_id,
-                organization_id=scoped_org_id,
-                run_id=scoped_run_id,
-                role="assistant",
-                content=terminal_output,
-                created_at_ms=now_ms,
+            sdk_client.write_chat_message(
+                ChatMessageWrite(
+                    agent_id=scoped_agent_id,
+                    organization_id=scoped_org_id,
+                    run_id=scoped_run_id,
+                    role="assistant",
+                    content=terminal_output,
+                    created_at_ms=now_ms,
+                )
             )
-        )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("runtime SDK write skipped: %s", exc)
 
     return {
         "schema_version": "v1",
