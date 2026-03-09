@@ -34,6 +34,8 @@ def _install_test_stubs() -> None:
 
     if "fastapi" not in sys.modules:
         fastapi_stub = types.ModuleType("fastapi")
+        fastapi_middleware_stub = types.ModuleType("fastapi.middleware")
+        fastapi_cors_stub = types.ModuleType("fastapi.middleware.cors")
 
         class HTTPException(Exception):
             def __init__(self, status_code: int, detail: str) -> None:
@@ -48,6 +50,9 @@ def _install_test_stubs() -> None:
         class FastAPI:
             def __init__(self, *args, **kwargs) -> None:
                 pass
+
+            def add_middleware(self, *args, **kwargs):
+                return None
 
             def get(self, *args, **kwargs):
                 def decorator(func):
@@ -70,7 +75,10 @@ def _install_test_stubs() -> None:
         setattr(fastapi_stub, "FastAPI", FastAPI)
         setattr(fastapi_stub, "HTTPException", HTTPException)
         setattr(fastapi_stub, "Request", Request)
+        setattr(fastapi_cors_stub, "CORSMiddleware", object)
         sys.modules["fastapi"] = fastapi_stub
+        sys.modules["fastapi.middleware"] = fastapi_middleware_stub
+        sys.modules["fastapi.middleware.cors"] = fastapi_cors_stub
 
     if "pydantic" not in sys.modules:
         pydantic_stub = types.ModuleType("pydantic")

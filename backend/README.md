@@ -45,16 +45,20 @@ uvicorn app:app --host 0.0.0.0 --port 8091 --reload
 
 ## Invoke trust env vars
 
-Invoke trust is disabled by default.
+Invoke trust is enabled in template examples.
 
 - `RUNTIME_INVOKE_TRUST_ENABLED=true`
 - `RUNTIME_INVOKE_TOKEN_ISSUER`
 - `RUNTIME_INVOKE_TOKEN_AUDIENCE`
-- One of:
+- Exactly one of:
   - `RUNTIME_INVOKE_TOKEN_SIGNING_KEY`
   - `RUNTIME_INVOKE_TOKEN_JWKS_URL`
 
 When enabled, `/invoke` requires `Authorization: Bearer <token>`.
+
+## Bootstrap vars
+
+Startup bootstrap vars are intentionally removed from default examples for this template sync. Add them only when you explicitly need startup registration automation.
 
 ## Optional control-plane env vars
 
