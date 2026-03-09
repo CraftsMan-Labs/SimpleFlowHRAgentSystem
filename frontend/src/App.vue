@@ -6,9 +6,11 @@ import { clearAccessToken, readAccessToken, storeAccessToken } from './authToken
 
 const themeStorageKey = 'simpleflow-hr-theme'
 
-const controlPlaneBaseUrl = ref(import.meta.env.VITE_CONTROL_PLANE_BASE_URL || 'http://localhost:8080')
+const templateBackendBaseUrl = ref(import.meta.env.VITE_TEMPLATE_BACKEND_BASE_URL || 'http://localhost:8092')
 const agentId = ref(import.meta.env.VITE_AGENT_ID || '')
 const agentVersion = ref(import.meta.env.VITE_AGENT_VERSION || 'v1')
+const selectedAgentKey = ref('')
+const availableAgents = ref([])
 
 const email = ref('')
 const password = ref('')
@@ -22,10 +24,11 @@ const accessToken = ref('')
 const showConfig = ref(false)
 
 const registrationGate = reactive({
-  state: 'unknown',
-  message: 'Sign in to validate runtime registration.',
+  state: 'not_started',
+  message: 'Sign in to start onboarding.',
   registrationId: ''
 })
+const onboardingBusy = ref(false)
 
 const sessions = ref([])
 const activeChatId = ref('')
@@ -124,7 +127,7 @@ async function requestControlPlane(path, options = {}) {
   const body = options.body
   const headers = { ...(options.headers || {}) }
   const token = accessToken.value.trim()
-  const url = `${controlPlaneBaseUrl.value.replace(/\/$/, '')}${path}`
+  const url = `${templateBackendBaseUrl.value.replace(/\/$/, '')}${path}`
 
   if (options.requiresAuth !== false && token !== '') {
     headers.Authorization = `Bearer ${token}`
@@ -188,6 +191,8 @@ function clearLocalSession(notice = 'Signed out.') {
   accessToken.value = ''
   me.value = null
   sessions.value = []
+  availableAgents.value = []
+  selectedAgentKey.value = ''
   activeChatId.value = ''
   conversation.value = []
   registrationGate.state = 'unknown'
@@ -298,15 +303,59 @@ function normalizeSession(item) {
   }
 }
 
+function agentOptionKey(agent) {
+  const id = typeof agent?.agent_id === 'string' ? agent.agent_id.trim() : ''
+  const version = typeof agent?.agent_version === 'string' ? agent.agent_version.trim() : ''
+  return `${id}::${version}`
+}
+
+function applySelectedAgentKey() {
+  const [nextAgentId, nextAgentVersion] = selectedAgentKey.value.split('::')
+  agentId.value = (nextAgentId || '').trim()
+  agentVersion.value = (nextAgentVersion || '').trim() || 'v1'
+}
+
+async function fetchAvailableAgents() {
+  const payload = await requestControlPlane('/api/agents/available', { method: 'GET' })
+  const items = Array.isArray(payload?.agents) ? payload.agents : []
+  availableAgents.value = items.filter((item) => {
+    return typeof item?.agent_id === 'string' && item.agent_id.trim() !== ''
+  })
+
+  if (availableAgents.value.length === 0) {
+    selectedAgentKey.value = ''
+    agentId.value = ''
+    agentVersion.value = 'v1'
+    return
+  }
+
+  const currentKey = _agentKey(agentId.value, agentVersion.value)
+  const matching = availableAgents.value.find((item) => agentOptionKey(item) === currentKey)
+  if (matching) {
+    selectedAgentKey.value = currentKey
+    return
+  }
+
+  const defaultAgent = payload?.default_agent
+  const defaultKey = _agentKey(defaultAgent?.agent_id || '', defaultAgent?.agent_version || '')
+  const fallback = availableAgents.value.find((item) => agentOptionKey(item) === defaultKey) || availableAgents.value[0]
+  selectedAgentKey.value = agentOptionKey(fallback)
+  applySelectedAgentKey()
+}
+
+function _agentKey(id, version) {
+  return `${String(id || '').trim()}::${String(version || '').trim()}`
+}
+
 async function fetchMe() {
-  const payload = await requestControlPlane('/v1/me', { method: 'GET' })
+  const payload = await requestControlPlane('/api/control-plane/me', { method: 'GET' })
   me.value = payload
 }
 
 async function preflightRegistration() {
   if (authState.value !== 'signed-in') {
-    registrationGate.state = 'unknown'
-    registrationGate.message = 'Sign in to validate runtime registration.'
+    registrationGate.state = 'not_started'
+    registrationGate.message = 'Sign in to start onboarding.'
     registrationGate.registrationId = ''
     return
   }
@@ -315,38 +364,47 @@ async function preflightRegistration() {
   const trimmedVersion = agentVersion.value.trim()
   if (trimmedAgentId === '' || trimmedVersion === '') {
     registrationGate.state = 'missing'
-    registrationGate.message = 'Set both agent id and version before sending chat turns.'
+    registrationGate.message = 'No agent is selected.'
     registrationGate.registrationId = ''
     return
   }
 
   registrationGate.state = 'checking'
-  registrationGate.message = 'Checking runtime registration status...'
+  registrationGate.message = 'Checking onboarding status...'
   registrationGate.registrationId = ''
 
   try {
     const response = await requestControlPlane(
-      `/v1/runtime/registrations?agent_id=${encodeURIComponent(trimmedAgentId)}&agent_version=${encodeURIComponent(trimmedVersion)}`,
+      `/api/onboarding/status?agent_id=${encodeURIComponent(trimmedAgentId)}&agent_version=${encodeURIComponent(trimmedVersion)}`,
       { method: 'GET' }
     )
-    const registrations = Array.isArray(response?.registrations) ? response.registrations : []
-    const active = registrations.find((item) => normalizeStatus(item) === 'active')
+    const state = typeof response?.state === 'string' ? response.state.trim().toLowerCase() : 'not_started'
+    const message = typeof response?.message === 'string' ? response.message : ''
+    registrationGate.registrationId = response?.registration_id || ''
 
-    if (!active) {
-      if (registrations.length === 0) {
-        registrationGate.state = 'missing'
-        registrationGate.message = 'No registration found. Create, validate, and activate runtime registration in control plane.'
-      } else {
-        registrationGate.state = 'inactive'
-        registrationGate.message = 'Registration exists but is not active. Activate registration before sending.'
-      }
-      registrationGate.registrationId = ''
+    if (state === 'active') {
+      registrationGate.state = 'ready'
+      registrationGate.message = message || 'Onboarding is complete. Chat is enabled.'
+      return
+    }
+    if (state === 'in_progress') {
+      registrationGate.state = 'checking'
+      registrationGate.message = message || 'Onboarding is running.'
+      return
+    }
+    if (state === 'blocked') {
+      registrationGate.state = 'unauthorized'
+      registrationGate.message = message || 'Onboarding is blocked by auth or scope policy.'
+      return
+    }
+    if (state === 'failed') {
+      registrationGate.state = 'error'
+      registrationGate.message = message || 'Onboarding failed. Retry to continue.'
       return
     }
 
-    registrationGate.state = 'ready'
-    registrationGate.message = 'Active runtime registration found. Chat is enabled.'
-    registrationGate.registrationId = active.id || active.ID || ''
+    registrationGate.state = 'missing'
+    registrationGate.message = message || 'Onboarding has not started yet.'
   } catch (requestError) {
     const message = requestError instanceof Error ? requestError.message : 'Registration preflight failed.'
     if (message.toLowerCase().includes('unauthorized')) {
@@ -356,6 +414,61 @@ async function preflightRegistration() {
       registrationGate.state = 'error'
       registrationGate.message = message
     }
+  }
+}
+
+async function recheckRegistration() {
+  error.value = ''
+  if (authState.value !== 'signed-in') {
+    registrationGate.state = 'unknown'
+    registrationGate.message = 'Sign in first, then recheck registration.'
+    authNotice.value = 'Sign in is required before registration checks.'
+    return
+  }
+  await preflightRegistration()
+}
+
+async function startOnboarding() {
+  if (authState.value !== 'signed-in' || onboardingBusy.value) {
+    return
+  }
+  onboardingBusy.value = true
+  error.value = ''
+  try {
+    await requestControlPlane('/api/onboarding/start', {
+      method: 'POST',
+      body: {
+        agent_id: agentId.value.trim(),
+        agent_version: agentVersion.value.trim()
+      }
+    })
+    await preflightRegistration()
+  } catch (requestError) {
+    error.value = requestError instanceof Error ? requestError.message : 'Onboarding start failed.'
+  } finally {
+    onboardingBusy.value = false
+  }
+}
+
+async function retryOnboarding() {
+  if (authState.value !== 'signed-in' || onboardingBusy.value) {
+    return
+  }
+  onboardingBusy.value = true
+  error.value = ''
+  try {
+    await requestControlPlane('/api/onboarding/retry', {
+      method: 'POST',
+      body: {
+        agent_id: agentId.value.trim(),
+        agent_version: agentVersion.value.trim()
+      }
+    })
+    await preflightRegistration()
+  } catch (requestError) {
+    error.value = requestError instanceof Error ? requestError.message : 'Onboarding retry failed.'
+  } finally {
+    onboardingBusy.value = false
   }
 }
 
@@ -392,7 +505,7 @@ async function loadSessions() {
   }
 
   const payload = await requestControlPlane(
-    `/v1/chat/history/sessions?agent_id=${encodeURIComponent(trimmedAgentId)}&user_id=${encodeURIComponent(userId)}&status=active&limit=50`,
+    `/api/control-plane/chat/history/sessions?agent_id=${encodeURIComponent(trimmedAgentId)}&user_id=${encodeURIComponent(userId)}&status=active&limit=50`,
     { method: 'GET' }
   )
   const items = Array.isArray(payload?.sessions) ? payload.sessions.map(normalizeSession) : []
@@ -412,7 +525,7 @@ async function loadHistory(chatId) {
   }
 
   const payload = await requestControlPlane(
-    `/v1/chat/history/messages?agent_id=${encodeURIComponent(trimmedAgentId)}&chat_id=${encodeURIComponent(trimmedChatId)}&user_id=${encodeURIComponent(userId)}&limit=200`,
+    `/api/control-plane/chat/history/messages?agent_id=${encodeURIComponent(trimmedAgentId)}&chat_id=${encodeURIComponent(trimmedChatId)}&user_id=${encodeURIComponent(userId)}&limit=200`,
     { method: 'GET' }
   )
   const messages = Array.isArray(payload?.messages) ? payload.messages : []
@@ -448,7 +561,7 @@ function createSession() {
 
 async function persistHistoryMessage({ chatId, messageId, role, text, runId }) {
   const userId = readUserId()
-  await requestControlPlane('/v1/chat/history/messages', {
+  await requestControlPlane('/api/control-plane/chat/history/messages', {
     method: 'POST',
     body: {
       agent_id: agentId.value.trim(),
@@ -477,7 +590,7 @@ async function persistHistoryMessage({ chatId, messageId, role, text, runId }) {
 
 async function patchHistoryMessage(messageId, { chatId, runId, role, text }) {
   const userId = readUserId()
-  await requestControlPlane(`/v1/chat/history/messages/${encodeURIComponent(messageId)}`, {
+  await requestControlPlane(`/api/control-plane/chat/history/messages/${encodeURIComponent(messageId)}`, {
     method: 'PATCH',
     body: {
       agent_id: agentId.value.trim(),
@@ -559,7 +672,7 @@ async function sendMessage() {
       idempotency_key: `invoke-${runId}`
     }
 
-    const invokeResult = await requestControlPlane('/v1/runtime/invoke', {
+    const invokeResult = await requestControlPlane('/api/control-plane/runtime/invoke', {
       method: 'POST',
       body: invokePayload
     })
@@ -601,7 +714,7 @@ async function signIn() {
   error.value = ''
 
   try {
-    const payload = await requestControlPlane('/v1/auth/sessions', {
+    const payload = await requestControlPlane('/api/control-plane/auth/sessions', {
       method: 'POST',
       requiresAuth: false,
       body: {
@@ -622,6 +735,7 @@ async function signIn() {
     accessToken.value = token.trim()
     storeAccessToken(accessToken.value)
     await fetchMe()
+    await fetchAvailableAgents()
     await preflightRegistration()
     await loadSessions()
     if (activeChatId.value.trim() !== '') {
@@ -646,7 +760,7 @@ async function signOut() {
   }
   authBusy.value = true
   try {
-    await requestControlPlane('/v1/auth/sessions/current', { method: 'DELETE' })
+    await requestControlPlane('/api/control-plane/auth/sessions/current', { method: 'DELETE' })
   } catch (_error) {
     // Ignore logout request failures and clear local state anyway.
   } finally {
@@ -654,6 +768,18 @@ async function signOut() {
     authBusy.value = false
   }
 }
+
+watch(selectedAgentKey, async () => {
+  applySelectedAgentKey()
+  if (authState.value !== 'signed-in') {
+    return
+  }
+  await preflightRegistration()
+  await loadSessions()
+  if (activeChatId.value.trim() !== '') {
+    await loadHistory(activeChatId.value)
+  }
+})
 
 watch([agentId, agentVersion], async () => {
   if (authState.value === 'signed-in') {
@@ -667,11 +793,8 @@ watch([agentId, agentVersion], async () => {
 
 onMounted(async () => {
   initializeTheme()
-  const envToken = typeof import.meta.env.VITE_CONTROL_PLANE_TOKEN === 'string'
-    ? import.meta.env.VITE_CONTROL_PLANE_TOKEN.trim()
-    : ''
   const cachedToken = readAccessToken()
-  accessToken.value = cachedToken || envToken
+  accessToken.value = cachedToken
   if (accessToken.value === '') {
     clearLocalSession('Sign in to use control-plane invoke and chat history.')
     return
@@ -681,6 +804,7 @@ onMounted(async () => {
   authNotice.value = 'Restoring session...'
   try {
     await fetchMe()
+    await fetchAvailableAgents()
     authState.value = 'signed-in'
     authNotice.value = 'Session restored.'
     await preflightRegistration()
@@ -721,26 +845,18 @@ onMounted(async () => {
         <strong>Session:</strong> {{ authState }}
       </article>
       <article class="pill" :class="`pill-${registrationGate.state}`">
-        <strong>Registration:</strong> {{ registrationGate.state }}
+        <strong>Onboarding:</strong> {{ registrationGate.state }}
       </article>
       <article class="notice">{{ authNotice }}</article>
     </section>
 
     <section v-if="showConfig" class="panel config-panel">
       <label>
-        Control Plane Base URL
-        <input v-model="controlPlaneBaseUrl" type="text" />
+        Template Backend Base URL
+        <input v-model="templateBackendBaseUrl" type="text" />
       </label>
-      <label>
-        Agent ID
-        <input v-model="agentId" type="text" placeholder="agent_..." />
-      </label>
-      <label>
-        Agent Version
-        <input v-model="agentVersion" type="text" placeholder="v1" />
-      </label>
-      <button type="button" class="btn" :disabled="authState !== 'signed-in'" @click="preflightRegistration">
-        Recheck Registration
+      <button type="button" class="btn" @click="recheckRegistration">
+        Refresh Onboarding
       </button>
     </section>
 
@@ -766,6 +882,14 @@ onMounted(async () => {
 
     <section v-else class="layout">
       <aside class="panel sessions-panel">
+        <label>
+          Agent
+          <select v-model="selectedAgentKey">
+            <option v-for="item in availableAgents" :key="agentOptionKey(item)" :value="agentOptionKey(item)">
+              {{ item.agent_id }} @ {{ item.agent_version }}
+            </option>
+          </select>
+        </label>
         <div class="sessions-head">
           <h2>Sessions</h2>
           <button type="button" class="btn" @click="createSession">New</button>
@@ -790,12 +914,20 @@ onMounted(async () => {
         <header class="chat-panel-head">
           <div>
             <h2>HR Chat</h2>
-            <p class="help">Chat invoke always goes through <code>POST /v1/runtime/invoke</code>.</p>
+            <p class="help">Chat invoke goes through <code>POST /api/control-plane/runtime/invoke</code> on template backend.</p>
           </div>
           <button type="button" class="btn ghost" @click="signOut">Sign Out</button>
         </header>
 
-        <p class="gate-message">{{ registrationGate.message }}</p>
+        <div class="onboarding-actions">
+          <p class="gate-message">{{ registrationGate.message }}</p>
+          <button v-if="registrationGate.state === 'missing'" type="button" class="btn" :disabled="onboardingBusy" @click="startOnboarding">
+            {{ onboardingBusy ? 'Starting...' : 'Start Onboarding' }}
+          </button>
+          <button v-if="registrationGate.state === 'error' || registrationGate.state === 'unauthorized'" type="button" class="btn" :disabled="onboardingBusy" @click="retryOnboarding">
+            {{ onboardingBusy ? 'Retrying...' : 'Retry Onboarding' }}
+          </button>
+        </div>
 
         <section class="messages">
           <article v-for="msg in conversation" :key="msg.id" class="bubble" :class="msg.role">
@@ -972,6 +1104,7 @@ label {
 }
 
 input,
+select,
 textarea {
   border: 1px solid var(--line);
   border-radius: 10px;
@@ -979,6 +1112,13 @@ textarea {
   font: inherit;
   background: color-mix(in srgb, var(--panel) 92%, transparent);
   color: var(--text);
+}
+
+.onboarding-actions {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 0.6rem;
 }
 
 .layout {

@@ -1,7 +1,12 @@
 const tokenKey = 'simpleflow-hr-access-token'
+const sharedControlPlaneTokenKey = 'simpleflow-access-token'
 
 export function readAccessToken() {
-  return window.localStorage.getItem(tokenKey) || ''
+  const localToken = window.localStorage.getItem(tokenKey) || ''
+  if (localToken.trim() !== '') {
+    return localToken
+  }
+  return window.localStorage.getItem(sharedControlPlaneTokenKey) || ''
 }
 
 export function storeAccessToken(token) {
