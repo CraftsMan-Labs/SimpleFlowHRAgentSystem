@@ -21,7 +21,6 @@ from simpleflow_sdk import (
     InvokeTokenVerifier,
     QueueContract,
     RuntimeEvent,
-    RuntimeRegistration,
     SimpleFlowAuthenticationError,
     SimpleFlowAuthorizationError,
     SimpleFlowClient,
@@ -101,7 +100,18 @@ agent_version = os.getenv("RUNTIME_AGENT_VERSION", "v1")
 
 api_base_url = os.getenv("SIMPLEFLOW_API_BASE_URL", "").strip()
 api_token = os.getenv("SIMPLEFLOW_API_TOKEN", "").strip()
-sdk_client = SimpleFlowClient(api_base_url, api_token) if api_base_url else None
+machine_client_id = os.getenv("SIMPLEFLOW_CLIENT_ID", "").strip()
+machine_client_secret = os.getenv("SIMPLEFLOW_CLIENT_SECRET", "").strip()
+sdk_client = (
+    SimpleFlowClient(
+        api_base_url,
+        api_token=api_token,
+        oauth_client_id=machine_client_id,
+        oauth_client_secret=machine_client_secret,
+    )
+    if api_base_url
+    else None
+)
 
 workflow_root = Path(
     os.getenv(
@@ -201,10 +211,6 @@ def _build_invoke_trust_config() -> InvokeTrustConfig:
         raise ValueError(
             "RUNTIME_INVOKE_TOKEN_AUDIENCE is required when invoke trust is enabled"
         )
-    if signing_key != "" and jwks_url != "":
-        raise ValueError(
-            "set only one of RUNTIME_INVOKE_TOKEN_SIGNING_KEY or RUNTIME_INVOKE_TOKEN_JWKS_URL"
-        )
     if signing_key == "" and jwks_url == "":
         raise ValueError(
             "set RUNTIME_INVOKE_TOKEN_SIGNING_KEY or RUNTIME_INVOKE_TOKEN_JWKS_URL when invoke trust is enabled"
@@ -256,9 +262,7 @@ def _verify_invoke_request(request: Request) -> InvokeScope:
     token = _extract_bearer_token(request)
     try:
         claims: dict[str, Any]
-        if shared_key_verifier is not None:
-            claims = shared_key_verifier.verify(token, invoke_trust_config.signing_key)
-        elif jwks_client is not None:
+        if jwks_client is not None:
             key = jwks_client.get_signing_key_from_jwt(token).key
             decoded = jwt.decode(
                 token,
@@ -269,6 +273,8 @@ def _verify_invoke_request(request: Request) -> InvokeScope:
                 options={"require": ["exp", "iat", "iss", "aud"]},
             )
             claims = decoded if isinstance(decoded, dict) else {}
+        elif shared_key_verifier is not None:
+            claims = shared_key_verifier.verify(token, invoke_trust_config.signing_key)
         else:
             raise ValueError("invoke trust verifier is not configured")
     except Exception as exc:  # noqa: BLE001
@@ -416,18 +422,18 @@ def _run_startup_bootstrap() -> None:
     if not env_bool("RUNTIME_BOOTSTRAP_REGISTER_ON_STARTUP", False):
         return
 
-    registration = RuntimeRegistration(
-        agent_id=agent_id,
-        agent_version=agent_version,
-        execution_mode=os.getenv(
+    registration = {
+        "agent_id": agent_id,
+        "agent_version": agent_version,
+        "execution_mode": os.getenv(
             "RUNTIME_BOOTSTRAP_EXECUTION_MODE", "remote_runtime"
         ).strip()
         or "remote_runtime",
-        endpoint_url=os.getenv("RUNTIME_BOOTSTRAP_ENDPOINT_URL", "").strip() or None,
-        auth_mode=os.getenv("RUNTIME_BOOTSTRAP_AUTH_MODE", "jwt").strip() or "jwt",
-        capabilities=["chat", "webhook", "queue"],
-        runtime_id=os.getenv("RUNTIME_BOOTSTRAP_RUNTIME_ID", "").strip() or None,
-    )
+        "endpoint_url": os.getenv("RUNTIME_BOOTSTRAP_ENDPOINT_URL", "").strip(),
+        "auth_mode": os.getenv("RUNTIME_BOOTSTRAP_AUTH_MODE", "jwt").strip() or "jwt",
+        "capabilities": ["chat", "webhook", "queue"],
+        "runtime_id": os.getenv("RUNTIME_BOOTSTRAP_RUNTIME_ID", "").strip(),
+    }
 
     try:
         created = sdk_client.register_runtime(registration)
@@ -438,9 +444,7 @@ def _run_startup_bootstrap() -> None:
         logger.warning("runtime bootstrap register failed: %s", exc)
         return
 
-    registration_id = str(created.get("id", "")).strip()
-    if registration_id == "":
-        registration_id = str(created.get("registration_id", "")).strip()
+    registration_id = _normalize_registration_id(created)
     if registration_id == "":
         registration_id = os.getenv("RUNTIME_BOOTSTRAP_REGISTRATION_ID", "").strip()
     if registration_id == "":
@@ -652,6 +656,135 @@ def _require_known_agent_id(runtime_agent_id: str) -> None:
     raise HTTPException(status_code=404, detail="agent is not available in catalog")
 
 
+def _read_non_empty_string(value: Any) -> str:
+    if isinstance(value, str):
+        return value.strip()
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
+def _read_string_field(payload: dict[str, Any], keys: tuple[str, ...]) -> str:
+    for key in keys:
+        if key in payload:
+            value = _read_non_empty_string(payload.get(key))
+            if value != "":
+                return value
+    return ""
+
+
+def _normalize_registration_id(payload: dict[str, Any]) -> str:
+    return _read_string_field(
+        payload,
+        (
+            "registration_id",
+            "registrationId",
+            "RegistrationID",
+            "id",
+            "ID",
+        ),
+    )
+
+
+def _normalize_registration_status(payload: dict[str, Any]) -> str:
+    raw_status = _read_string_field(
+        payload,
+        (
+            "status",
+            "Status",
+            "registration_status",
+            "registrationStatus",
+            "RegistrationStatus",
+        ),
+    ).lower()
+    if raw_status in {"active", "activated", "ready"}:
+        return "active"
+    if raw_status in {
+        "draft",
+        "pending",
+        "created",
+        "registered",
+        "validated",
+        "validating",
+        "activating",
+        "in_progress",
+        "in-progress",
+    }:
+        return "in_progress"
+    return "unknown"
+
+
+def _normalize_runtime_registration(item: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "registration_id": _normalize_registration_id(item),
+        "status": _normalize_registration_status(item),
+        "raw": item,
+    }
+
+
+def _normalize_runtime_registrations_payload(
+    payload: dict[str, Any],
+) -> list[dict[str, Any]]:
+    candidates = (
+        payload.get("registrations"),
+        payload.get("Registrations"),
+        payload.get("items"),
+        payload.get("Items"),
+    )
+    raw_items: list[Any] = []
+    for candidate in candidates:
+        if isinstance(candidate, list):
+            raw_items = candidate
+            break
+
+    normalized: list[dict[str, Any]] = []
+    for item in raw_items:
+        if isinstance(item, dict):
+            normalized.append(_normalize_runtime_registration(item))
+    return normalized
+
+
+def _normalize_control_plane_me(payload: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(payload)
+    user_payload = payload.get("user")
+    user = user_payload if isinstance(user_payload, dict) else {}
+
+    user_id = ""
+    for candidate in (
+        payload.get("id"),
+        payload.get("user_id"),
+        payload.get("userId"),
+        payload.get("UserID"),
+        user.get("id"),
+        user.get("user_id"),
+        user.get("userId"),
+        user.get("UserID"),
+    ):
+        user_id = _read_non_empty_string(candidate)
+        if user_id != "":
+            break
+
+    organization_id = ""
+    for candidate in (
+        payload.get("organization_id"),
+        payload.get("organizationId"),
+        payload.get("OrganizationID"),
+        user.get("organization_id"),
+        user.get("organizationId"),
+        user.get("OrganizationID"),
+    ):
+        organization_id = _read_non_empty_string(candidate)
+        if organization_id != "":
+            break
+
+    if user_id != "":
+        normalized["id"] = user_id
+        normalized["user_id"] = user_id
+    if organization_id != "":
+        normalized["organization_id"] = organization_id
+    return normalized
+
+
 def _onboarding_state_from_catalog(item: dict[str, Any]) -> dict[str, Any]:
     state = {
         "onboarding_id": f"onb_{uuid4().hex}",
@@ -693,10 +826,16 @@ def _build_machine_control_plane_client() -> SimpleFlowClient:
             status_code=503,
             detail="control plane is not configured; set SIMPLEFLOW_API_BASE_URL",
         )
+    if machine_client_id != "" and machine_client_secret != "":
+        return SimpleFlowClient(
+            api_base_url,
+            oauth_client_id=machine_client_id,
+            oauth_client_secret=machine_client_secret,
+        )
     if api_token == "":
         raise HTTPException(
             status_code=503,
-            detail="machine lifecycle token is required; set SIMPLEFLOW_API_TOKEN",
+            detail="machine credentials are required; set SIMPLEFLOW_CLIENT_ID and SIMPLEFLOW_CLIENT_SECRET",
         )
     return SimpleFlowClient(api_base_url, api_token)
 
@@ -719,19 +858,44 @@ def _run_onboarding_lifecycle(
     if config is None:
         raise HTTPException(status_code=404, detail="agent is not available in catalog")
 
-    registration = RuntimeRegistration(
-        agent_id=runtime_agent_id,
-        agent_version=runtime_agent_version,
-        execution_mode="remote_runtime",
-        endpoint_url=(str(config.get("endpoint_url", "")).strip() or None),
-        auth_mode="jwt",
-        capabilities=["chat", "webhook", "queue"],
-        runtime_id=(str(config.get("runtime_id", "")).strip() or None),
-    )
+    registration = {
+        "agent_id": runtime_agent_id,
+        "agent_version": runtime_agent_version,
+        "execution_mode": "remote_runtime",
+        "endpoint_url": str(config.get("endpoint_url", "")).strip(),
+        "auth_mode": "jwt",
+        "capabilities": ["chat", "webhook", "queue"],
+        "runtime_id": str(config.get("runtime_id", "")).strip(),
+    }
 
     client = _build_machine_control_plane_client()
     try:
-        result = client.ensure_runtime_registration_active(registration=registration)
+        created = client.register_runtime(registration)
+        registration_id = _normalize_registration_id(created)
+        if registration_id == "":
+            state["state"] = "failed"
+            state["steps"]["create"] = "failed"
+            raise HTTPException(
+                status_code=502,
+                detail="registration response missing registration id",
+            )
+
+        state["registration_id"] = registration_id
+        state["steps"]["create"] = "success"
+        state["steps"]["validate"] = "running"
+
+        validation = client.validate_runtime_registration(registration_id)
+        if isinstance(validation, dict) and validation.get("validation_ok") is False:
+            raise HTTPException(
+                status_code=502, detail="runtime registration validation failed"
+            )
+
+        state["steps"]["validate"] = "success"
+        state["steps"]["activate"] = "running"
+        client.activate_runtime_registration(registration_id)
+        result = {
+            "registration_id": registration_id,
+        }
     except SimpleFlowAuthenticationError as exc:
         state["state"] = "blocked"
         state["message"] = "machine auth failed for onboarding lifecycle"
@@ -774,6 +938,69 @@ def _onboarding_public_view(state: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _sync_onboarding_state_from_control_plane(
+    state: dict[str, Any], request: Request
+) -> dict[str, Any]:
+    runtime_agent_id = str(state.get("agent_id", "")).strip()
+    runtime_agent_version = str(state.get("agent_version", "")).strip()
+    if runtime_agent_id == "" or runtime_agent_version == "":
+        return state
+
+    path = _control_plane_query_path(
+        "/v1/runtime/registrations",
+        {
+            "agent_id": runtime_agent_id,
+            "agent_version": runtime_agent_version,
+        },
+    )
+
+    try:
+        payload = _control_plane_get(request, path=path, require_bearer=True)
+    except HTTPException:
+        return state
+
+    registrations = _normalize_runtime_registrations_payload(payload)
+    if len(registrations) == 0:
+        state["registration_id"] = ""
+        state["state"] = "not_started"
+        state["message"] = "Onboarding has not started."
+        state["steps"] = {
+            "create": "pending",
+            "validate": "pending",
+            "activate": "pending",
+        }
+        return state
+
+    active_registration = next(
+        (item for item in registrations if item.get("status") == "active"),
+        None,
+    )
+    selected = (
+        active_registration if active_registration is not None else registrations[0]
+    )
+    registration_id = _read_non_empty_string(selected.get("registration_id"))
+    state["registration_id"] = registration_id
+
+    if active_registration is not None:
+        state["state"] = "active"
+        state["message"] = "Onboarding is complete. Chat is enabled."
+        state["steps"] = {
+            "create": "success",
+            "validate": "success",
+            "activate": "success",
+        }
+        return state
+
+    state["state"] = "in_progress"
+    state["message"] = "Runtime registration exists but is not active yet."
+    state["steps"] = {
+        "create": "success",
+        "validate": "pending",
+        "activate": "pending",
+    }
+    return state
+
+
 @app.on_event("startup")
 def on_startup() -> None:
     _run_startup_bootstrap()
@@ -809,6 +1036,7 @@ def available_agents(request: Request) -> dict[str, Any]:
             str(item.get("agent_id", "")).strip(),
             str(item.get("agent_version", "")).strip(),
         )
+        state = _sync_onboarding_state_from_control_plane(state, request)
         agents.append(
             {
                 "agent_id": item.get("agent_id", ""),
@@ -858,6 +1086,21 @@ def onboarding_status(
         agent_version.strip() or os.getenv("RUNTIME_AGENT_VERSION", "v1").strip()
     )
     state = _get_or_create_onboarding_state(runtime_agent_id, runtime_agent_version)
+    state = _sync_onboarding_state_from_control_plane(state, request)
+    if str(state.get("state", "")).strip().lower() == "not_started":
+        try:
+            state = _run_onboarding_lifecycle(runtime_agent_id, runtime_agent_version)
+        except HTTPException as exc:
+            if exc.status_code == 401:
+                state["state"] = "blocked"
+                state["message"] = "machine auth failed for onboarding lifecycle"
+            elif exc.status_code == 403:
+                state["state"] = "blocked"
+                state["message"] = "machine token lacks lifecycle scope"
+            else:
+                state["state"] = "failed"
+                detail = str(exc.detail).strip()
+                state["message"] = detail if detail != "" else "onboarding failed"
     return _onboarding_public_view(state)
 
 
@@ -893,7 +1136,8 @@ def control_plane_delete_auth_session(request: Request) -> dict[str, Any]:
 
 @app.get("/api/control-plane/me")
 def control_plane_me(request: Request) -> dict[str, Any]:
-    return _control_plane_get(request, path="/v1/me", require_bearer=True)
+    payload = _control_plane_get(request, path="/v1/me", require_bearer=True)
+    return _normalize_control_plane_me(payload)
 
 
 @app.get("/api/control-plane/runtime/registrations")

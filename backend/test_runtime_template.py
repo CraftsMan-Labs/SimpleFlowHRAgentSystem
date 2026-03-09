@@ -261,6 +261,81 @@ class RuntimeTemplateTests(unittest.TestCase):
             ),
         )
 
+    def test_trust_config_allows_jwks_and_signing_key(self) -> None:
+        _install_test_stubs()
+        os.environ["RUNTIME_INVOKE_TRUST_ENABLED"] = "false"
+        import app as runtime_app
+
+        runtime_app = importlib.reload(runtime_app)
+        os.environ["RUNTIME_INVOKE_TRUST_ENABLED"] = "true"
+        os.environ["RUNTIME_INVOKE_TOKEN_ISSUER"] = "simpleflow-runtime"
+        os.environ["RUNTIME_INVOKE_TOKEN_AUDIENCE"] = "simpleflow-runtime"
+        os.environ["RUNTIME_INVOKE_TOKEN_SIGNING_KEY"] = "legacy-secret"
+        os.environ["RUNTIME_INVOKE_TOKEN_JWKS_URL"] = (
+            "http://backend:8080/.well-known/runtime-invoke-jwks.json"
+        )
+
+        config = runtime_app._build_invoke_trust_config()
+        self.assertEqual(
+            config.jwks_url, "http://backend:8080/.well-known/runtime-invoke-jwks.json"
+        )
+        self.assertEqual(config.signing_key, "legacy-secret")
+
+    def test_verify_invoke_prefers_jwks_when_configured(self) -> None:
+        _install_test_stubs()
+        os.environ["RUNTIME_INVOKE_TRUST_ENABLED"] = "false"
+        import app as runtime_app
+
+        runtime_app = importlib.reload(runtime_app)
+
+        class _SharedVerifier:
+            called = False
+
+            def verify(self, token: str, key: str):
+                self.called = True
+                raise AssertionError("shared verifier should not be called")
+
+        class _JWKSClient:
+            called = False
+
+            def get_signing_key_from_jwt(self, token: str):
+                self.called = True
+
+                class _Key:
+                    key = "jwks-key"
+
+                return _Key()
+
+        setattr(
+            runtime_app,
+            "invoke_trust_config",
+            runtime_app.InvokeTrustConfig(
+                enabled=True,
+                issuer="simpleflow-runtime",
+                audience="simpleflow-runtime",
+                signing_key="legacy-secret",
+                jwks_url="http://backend:8080/.well-known/runtime-invoke-jwks.json",
+            ),
+        )
+        setattr(runtime_app, "shared_key_verifier", _SharedVerifier())
+        setattr(runtime_app, "jwks_client", _JWKSClient())
+        runtime_app.jwt.decode = lambda *args, **kwargs: {
+            "agent_id": "agent_1",
+            "org_id": "org_1",
+            "user_id": "user_1",
+            "run_id": "run_1",
+        }
+
+        request = runtime_app.Request()
+        request.headers = {"authorization": "Bearer test-token"}
+
+        scope = runtime_app._verify_invoke_request(request)
+        self.assertEqual(scope.agent_id, "agent_1")
+        jwks_client = getattr(runtime_app, "jwks_client")
+        shared_key_verifier = getattr(runtime_app, "shared_key_verifier")
+        self.assertTrue(jwks_client.called)
+        self.assertFalse(shared_key_verifier.called)
+
     def test_build_workflow_messages_prefers_messages_array(self) -> None:
         _install_test_stubs()
         import app as runtime_app
@@ -313,6 +388,115 @@ class RuntimeTemplateTests(unittest.TestCase):
         )
         self.assertEqual(state["state"], "not_started")
         self.assertEqual(state["steps"]["create"], "pending")
+
+    def test_normalize_registration_id_handles_case_variants(self) -> None:
+        _install_test_stubs()
+        os.environ["RUNTIME_INVOKE_TRUST_ENABLED"] = "false"
+        import app as runtime_app
+
+        runtime_app = importlib.reload(runtime_app)
+        self.assertEqual(
+            runtime_app._normalize_registration_id({"RegistrationID": "reg_upper"}),
+            "reg_upper",
+        )
+        self.assertEqual(
+            runtime_app._normalize_registration_id({"registrationId": "reg_camel"}),
+            "reg_camel",
+        )
+
+    def test_sync_onboarding_marks_active_for_case_variant_status(self) -> None:
+        _install_test_stubs()
+        os.environ["RUNTIME_INVOKE_TRUST_ENABLED"] = "false"
+        import app as runtime_app
+
+        runtime_app = importlib.reload(runtime_app)
+        state = runtime_app._onboarding_state_from_catalog(
+            {
+                "agent_id": runtime_app.agent_id,
+                "agent_version": runtime_app.agent_version,
+                "runtime_id": "",
+                "endpoint_url": "",
+            }
+        )
+        original_get = runtime_app._control_plane_get
+        setattr(
+            runtime_app,
+            "_control_plane_get",
+            lambda *args, **kwargs: {
+                "Registrations": [
+                    {
+                        "RegistrationID": "reg_case",
+                        "Status": "ACTIVE",
+                    }
+                ]
+            },
+        )
+        try:
+            result = runtime_app._sync_onboarding_state_from_control_plane(
+                state,
+                runtime_app.Request(),
+            )
+        finally:
+            setattr(runtime_app, "_control_plane_get", original_get)
+
+        self.assertEqual(result["state"], "active")
+        self.assertEqual(result["registration_id"], "reg_case")
+
+    def test_sync_onboarding_not_started_only_when_no_registration_exists(self) -> None:
+        _install_test_stubs()
+        os.environ["RUNTIME_INVOKE_TRUST_ENABLED"] = "false"
+        import app as runtime_app
+
+        runtime_app = importlib.reload(runtime_app)
+        state = runtime_app._onboarding_state_from_catalog(
+            {
+                "agent_id": runtime_app.agent_id,
+                "agent_version": runtime_app.agent_version,
+                "runtime_id": "",
+                "endpoint_url": "",
+            }
+        )
+        original_get = runtime_app._control_plane_get
+        setattr(
+            runtime_app,
+            "_control_plane_get",
+            lambda *args, **kwargs: {"registrations": [{"id": "reg_unknown"}]},
+        )
+        try:
+            result = runtime_app._sync_onboarding_state_from_control_plane(
+                state,
+                runtime_app.Request(),
+            )
+        finally:
+            setattr(runtime_app, "_control_plane_get", original_get)
+
+        self.assertEqual(result["state"], "in_progress")
+        self.assertEqual(result["registration_id"], "reg_unknown")
+
+    def test_control_plane_me_normalizes_user_and_org_ids(self) -> None:
+        _install_test_stubs()
+        os.environ["RUNTIME_INVOKE_TRUST_ENABLED"] = "false"
+        import app as runtime_app
+
+        runtime_app = importlib.reload(runtime_app)
+        original_get = runtime_app._control_plane_get
+        setattr(
+            runtime_app,
+            "_control_plane_get",
+            lambda *args, **kwargs: {
+                "user": {
+                    "UserID": "user_123",
+                    "OrganizationID": "org_abc",
+                }
+            },
+        )
+        try:
+            result = runtime_app.control_plane_me(runtime_app.Request())
+        finally:
+            setattr(runtime_app, "_control_plane_get", original_get)
+
+        self.assertEqual(result["user_id"], "user_123")
+        self.assertEqual(result["organization_id"], "org_abc")
 
 
 if __name__ == "__main__":
