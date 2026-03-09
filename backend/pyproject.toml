@@ -1,0 +1,15 @@
+[project]
+name = "simpleflow-runtime-template-python"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+  "fastapi>=0.115.0,<1.0.0",
+  "uvicorn>=0.30.0,<1.0.0",
+  "PyJWT>=2.10.0,<3.0.0",
+  "simpleflow-sdk>=0.1.0",
+  "simple-agents-py>=0.1.0",
+]
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
