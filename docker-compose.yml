@@ -1,6 +1,9 @@
 services:
   hr-backend:
-    image: python:3.12-slim
+    build:
+      context: ../..
+      dockerfile: SimpleFlowTestTempaltes/SimpleFlowHRAgentSystem/backend/Dockerfile
+    image: simpleflow-hr-backend:dev
     container_name: simpleflow-hr-runtime
     working_dir: /workspace/backend
     env_file:
@@ -8,15 +11,7 @@ services:
     environment:
       WORKFLOW_ROOT: /workspace/workflows
       PYTHONUNBUFFERED: "1"
-    command: >-
-      sh -lc "
-      apt-get update &&
-      apt-get install -y --no-install-recommends build-essential pkg-config libssl-dev &&
-      pip install --no-cache-dir fastapi uvicorn PyJWT &&
-      pip install --no-cache-dir -e /deps/SimpleFlowSDKs/python &&
-      pip install --no-cache-dir -e /deps/SimpleAgents/crates/simple-agents-py &&
-      uvicorn app:app --host 0.0.0.0 --port 8091
-      "
+    command: uvicorn app:app --host 0.0.0.0 --port 8091
     volumes:
       - ./backend:/workspace/backend
       - ./workflows:/workspace/workflows
@@ -27,21 +22,22 @@ services:
     networks:
       - default
       - simpleflow_control_plane
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
 
   hr-frontend:
-    image: node:20-alpine
+    build:
+      context: ../..
+      dockerfile: SimpleFlowTestTempaltes/SimpleFlowHRAgentSystem/frontend/Dockerfile
+    image: simpleflow-hr-frontend:dev
     container_name: simpleflow-hr-frontend
     working_dir: /workspace/frontend
     env_file:
       - ./frontend/.env
-    command: >-
-      sh -lc "
-      npm install &&
-      npm run build &&
-      npm run preview -- --host 0.0.0.0 --port 5173
-      "
+    command: sh -lc "npm run build && npm run preview -- --host 0.0.0.0 --port 5173"
     volumes:
       - ./frontend:/workspace/frontend
+      - hr-frontend-node-modules:/workspace/frontend/node_modules
     ports:
       - "5175:5173"
     depends_on:
@@ -51,3 +47,6 @@ networks:
   simpleflow_control_plane:
     external: true
     name: simpleflow_default
+
+volumes:
+  hr-frontend-node-modules:
