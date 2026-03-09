@@ -211,6 +211,37 @@ def _install_test_stubs() -> None:
 
 
 class RuntimeTemplateTests(unittest.TestCase):
+    def test_token_metrics_from_nerdstats_uses_total_tokens(self) -> None:
+        _install_test_stubs()
+        os.environ["RUNTIME_INVOKE_TRUST_ENABLED"] = "false"
+        import app as runtime_app
+
+        runtime_app = importlib.reload(runtime_app)
+        metrics = runtime_app._token_metrics_from_nerdstats(
+            {
+                "total_tokens": 456,
+                "total_input_tokens": 123,
+                "total_output_tokens": 333,
+            }
+        )
+        self.assertEqual(metrics.get("prompt_tokens"), 123)
+        self.assertEqual(metrics.get("completion_tokens"), 333)
+        self.assertEqual(metrics.get("total_tokens"), 456)
+
+    def test_token_metrics_from_nerdstats_falls_back_to_sum(self) -> None:
+        _install_test_stubs()
+        os.environ["RUNTIME_INVOKE_TRUST_ENABLED"] = "false"
+        import app as runtime_app
+
+        runtime_app = importlib.reload(runtime_app)
+        metrics = runtime_app._token_metrics_from_nerdstats(
+            {
+                "total_input_tokens": "10",
+                "total_output_tokens": "15",
+            }
+        )
+        self.assertEqual(metrics.get("total_tokens"), 25)
+
     def test_extract_workflow_nerdstats_from_workflow_completed_event(self) -> None:
         _install_test_stubs()
         os.environ["RUNTIME_INVOKE_TRUST_ENABLED"] = "false"

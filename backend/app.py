@@ -460,6 +460,49 @@ def _build_chat_message_metadata(
     return metadata
 
 
+def _coerce_int(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        if value.is_integer():
+            return int(value)
+        return None
+    text = str(value).strip()
+    if text == "":
+        return None
+    if text.isdigit():
+        return int(text)
+    return None
+
+
+def _token_metrics_from_nerdstats(nerdstats: Any) -> dict[str, int]:
+    if not isinstance(nerdstats, dict):
+        return {}
+    total_tokens = _coerce_int(nerdstats.get("total_tokens"))
+    prompt_tokens = _coerce_int(nerdstats.get("total_input_tokens"))
+    completion_tokens = _coerce_int(nerdstats.get("total_output_tokens"))
+
+    metrics: dict[str, int] = {}
+    if prompt_tokens is not None and prompt_tokens >= 0:
+        metrics["prompt_tokens"] = prompt_tokens
+    if completion_tokens is not None and completion_tokens >= 0:
+        metrics["completion_tokens"] = completion_tokens
+    if total_tokens is not None and total_tokens >= 0:
+        metrics["total_tokens"] = total_tokens
+    elif (
+        "prompt_tokens" in metrics
+        and "completion_tokens" in metrics
+        and metrics["prompt_tokens"] >= 0
+        and metrics["completion_tokens"] >= 0
+    ):
+        metrics["total_tokens"] = (
+            metrics["prompt_tokens"] + metrics["completion_tokens"]
+        )
+    return metrics
+
+
 def _build_workflow_registry() -> dict[str, str]:
     subgraph_path = workflow_root / "hr-warning-email-subgraph.yaml"
     if not subgraph_path.exists():
@@ -1355,6 +1398,8 @@ def invoke(req: InvokeRequest, request: Request) -> dict[str, Any]:
         workflow_result.get("terminal_output"), workflow_result
     )
     chat_message_metadata = _build_chat_message_metadata(req, workflow_result)
+    nerdstats_payload = chat_message_metadata.get("nerdstats")
+    token_metrics = _token_metrics_from_nerdstats(nerdstats_payload)
     trace_context = chat_message_metadata.get("trace_context")
     trace_url = ""
     if isinstance(trace_context, dict):
@@ -1379,20 +1424,37 @@ def invoke(req: InvokeRequest, request: Request) -> dict[str, Any]:
                         "trace_url": trace_url,
                         "event_counts": chat_message_metadata.get("event_counts", {}),
                         "nerdstats": chat_message_metadata.get("nerdstats"),
+                        "metrics": token_metrics,
                     },
                 )
             )
-            sdk_client.write_chat_message(
-                ChatMessageWrite(
+            write_from_workflow = getattr(
+                sdk_client, "write_chat_message_from_workflow_result", None
+            )
+            if callable(write_from_workflow):
+                write_from_workflow(
                     agent_id=scoped_agent_id,
                     organization_id=scoped_org_id,
                     run_id=scoped_run_id,
                     role="assistant",
-                    content=chat_message_content,
-                    metadata=chat_message_metadata,
+                    workflow_result=workflow_result,
+                    trace_id=str(req.trace.trace_id).strip(),
+                    span_id=str(req.trace.span_id).strip(),
+                    tenant_id=str(req.trace.tenant_id).strip(),
                     created_at_ms=now_ms,
                 )
-            )
+            else:
+                sdk_client.write_chat_message(
+                    ChatMessageWrite(
+                        agent_id=scoped_agent_id,
+                        organization_id=scoped_org_id,
+                        run_id=scoped_run_id,
+                        role="assistant",
+                        content=chat_message_content,
+                        metadata=chat_message_metadata,
+                        created_at_ms=now_ms,
+                    )
+                )
         except Exception as exc:  # noqa: BLE001
             logger.warning("runtime SDK write skipped: %s", exc)
 
@@ -1405,12 +1467,14 @@ def invoke(req: InvokeRequest, request: Request) -> dict[str, Any]:
             "workflow_id": workflow_result.get("workflow_id"),
             "terminal_node": workflow_result.get("terminal_node"),
             "trace_url": trace_url,
+            "nerdstats": nerdstats_payload,
         },
         "error": None,
         "metrics": {
             "started_at_ms": now_ms,
             "finished_at_ms": int(time.time() * 1000),
             "duration_ms": 1,
+            **token_metrics,
         },
     }
 
