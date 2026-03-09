@@ -1,34 +1,34 @@
-.PHONY: help setup backend-env frontend-env test-backend build-frontend run-backend run-frontend smoke
+.PHONY: help up down ps logs test-backend build-frontend smoke
 
 help:
 	@printf "SimpleFlowHRAgentSystem targets:\n"
-	@printf "  make setup         # install backend and frontend dependencies\n"
+	@printf "  make up            # start backend/frontend in Docker\n"
+	@printf "  make down          # stop Docker services\n"
+	@printf "  make ps            # show running containers\n"
+	@printf "  make logs          # stream Docker service logs\n"
 	@printf "  make test-backend  # run backend unit tests\n"
-	@printf "  make build-frontend# build frontend bundle\n"
-	@printf "  make run-backend   # start backend on :8091\n"
-	@printf "  make run-frontend  # start frontend on :5173\n"
+	@printf "  make build-frontend# build frontend bundle in Docker\n"
 	@printf "  make smoke         # health/meta/invoke smoke checks\n"
 
-setup:
-	python -m venv backend/.venv
-	backend/.venv/bin/pip install fastapi uvicorn PyJWT
-	backend/.venv/bin/pip install -e ../../SimpleFlowSDKs/python
-	backend/.venv/bin/pip install -e ../../SimpleAgents/crates/simple-agents-py
-	npm --prefix frontend install
+up:
+	docker compose up -d
+
+down:
+	docker compose down
+
+ps:
+	docker compose ps
+
+logs:
+	docker compose logs -f --tail=120
 
 test-backend:
-	python -m unittest -v backend/test_runtime_template.py
+	docker compose run --rm hr-backend python -m unittest -v test_runtime_template.py
 
 build-frontend:
-	npm --prefix frontend run build
-
-run-backend:
-	backend/.venv/bin/uvicorn app:app --app-dir backend --host 0.0.0.0 --port 8091 --reload
-
-run-frontend:
-	npm --prefix frontend run dev
+	docker compose run --rm hr-frontend npm run build
 
 smoke:
-	curl -sS http://localhost:8091/health
-	curl -sS http://localhost:8091/meta
-	curl -sS -X POST http://localhost:8091/invoke -H "Content-Type: application/json" -d '{"schema_version":"v1","run_id":"run-smoke-1","agent_id":"hr-agent-runtime","agent_version":"v1","mode":"realtime","trace":{"trace_id":"trace1","span_id":"span1","tenant_id":"dev-org"},"input":{"message":"Draft an HR warning email for repeated delays"},"deadline_ms":0,"idempotency_key":"smoke-1"}'
+	curl -sS http://localhost:8092/health
+	curl -sS http://localhost:8092/meta
+	curl -sS -X POST http://localhost:8092/invoke -H "Content-Type: application/json" -d '{"schema_version":"v1","run_id":"run-smoke-1","agent_id":"hr-agent-runtime","agent_version":"v1","mode":"realtime","trace":{"trace_id":"trace1","span_id":"span1","tenant_id":"dev-org"},"input":{"message":"Draft an HR warning email for repeated delays"},"deadline_ms":0,"idempotency_key":"smoke-1"}'

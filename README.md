@@ -1,6 +1,6 @@
 # SimpleFlowHRAgentSystem
 
-Standalone test repo for an HR-focused SimpleFlow runtime built from SimpleFlow templates.
+Standalone test repo for an HR-focused SimpleFlow runtime built from SimpleFlow templates, running in Docker only.
 
 ## What this repo includes
 
@@ -25,21 +25,23 @@ Additional helper endpoints:
 ```bash
 cp backend/.env.example backend/.env
 cp frontend/.env.example frontend/.env
-make setup
+make up
 ```
 
-Start services in separate terminals:
+Open:
 
 ```bash
-make run-backend
-make run-frontend
+http://localhost:8092/health
+http://localhost:5175
 ```
+
+Use `make logs` to stream both services and `make down` to stop them.
 
 ## Workflows
 
 Configured by env vars in `backend/.env`:
 
-- `WORKFLOW_ROOT=../workflows`
+- `WORKFLOW_ROOT=/workspace/workflows`
 - `WORKFLOW_ENTRY_FILE=email-chat-orchestrator-with-subgraph-tool.yaml`
 
 `/invoke` converts runtime input into workflow `input.messages`, executes the selected YAML graph via `simple_agents_py`, and returns terminal output as `output.reply`.
@@ -54,11 +56,17 @@ make build-frontend
 make smoke
 ```
 
-## Optional local editable installs
+## Control-plane linking
 
-If `simpleflow-sdk` or `simple-agents-py` are not available from your package index:
+This repo joins `simpleflow_default` Docker network. When registering runtime in SimpleFlow control-plane, use:
 
-```bash
-backend/.venv/bin/pip install -e ../../SimpleFlowSDKs/python
-backend/.venv/bin/pip install -e ../../SimpleAgents/crates/simple-agents-py
-```
+- `endpoint_url`: `http://simpleflow-hr-runtime:8091`
+
+This avoids host-network routing issues from control-plane backend containers.
+
+## Notes
+
+- Start the SimpleFlow stack first so external Docker network `simpleflow_default` exists.
+- `make up` installs backend dependencies in-container from sibling repos:
+  - `../../SimpleFlowSDKs/python`
+  - `../../SimpleAgents/crates/simple-agents-py`
