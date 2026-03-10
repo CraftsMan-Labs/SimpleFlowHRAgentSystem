@@ -1,0 +1,22 @@
+{
+  "include": [
+    "backend"
+  ],
+  "exclude": [
+    "**/__pycache__",
+    "backend/.venv",
+    "backend/uv.lock"
+  ],
+  "venvPath": "backend",
+  "venv": ".venv",
+  "pythonVersion": "3.11",
+  "executionEnvironments": [
+    {
+      "root": "backend",
+      "extraPaths": [
+        "/home/rishub/Desktop/projects/rishub/SimpleFlowSDKs/python"
+      ]
+    }
+  ],
+  "reportMissingImports": true
+}
