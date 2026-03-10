@@ -1,21 +1,19 @@
 from __future__ import annotations
 
+import json
 import logging
 import os
 import time
-import json
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlencode
 from uuid import uuid4
 
 import jwt
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-
 from simpleflow_sdk import (
     ChatMessageWrite,
     InvokeTokenVerifier,
@@ -24,6 +22,27 @@ from simpleflow_sdk import (
     SimpleFlowAuthorizationError,
     SimpleFlowClient,
     SimpleFlowLifecycleError,
+)
+from runtime_helpers.control_plane import (
+    ControlPlaneConfig,
+    build_control_plane_client,
+    control_plane_delete,
+    control_plane_get,
+    control_plane_patch,
+    control_plane_post,
+    control_plane_query_path,
+    map_control_plane_error,
+    normalize_control_plane_me,
+    read_auth_bearer_token,
+)
+from runtime_helpers.workflow import (
+    build_chat_message_content,
+    build_chat_message_metadata,
+    build_workflow_messages,
+    extract_workflow_nerdstats,
+    resolve_chat_id,
+    token_metrics_from_nerdstats,
+    workflow_text_output,
 )
 
 
@@ -101,6 +120,9 @@ api_base_url = os.getenv("SIMPLEFLOW_API_BASE_URL", "").strip()
 api_token = os.getenv("SIMPLEFLOW_API_TOKEN", "").strip()
 machine_client_id = os.getenv("SIMPLEFLOW_CLIENT_ID", "").strip()
 machine_client_secret = os.getenv("SIMPLEFLOW_CLIENT_SECRET", "").strip()
+control_plane_config = ControlPlaneConfig(
+    api_base_url=api_base_url, api_token=api_token
+)
 sdk_client = (
     SimpleFlowClient(
         api_base_url,
@@ -335,184 +357,37 @@ def _load_workflow_client() -> Any:
 
 
 def _build_workflow_messages(payload: dict[str, Any]) -> list[dict[str, str]]:
-    raw_messages = payload.get("messages")
-    if isinstance(raw_messages, list):
-        collected: list[dict[str, str]] = []
-        for item in raw_messages:
-            if not isinstance(item, dict):
-                continue
-            role = str(item.get("role", "")).strip()
-            content = str(item.get("content", "")).strip()
-            if role == "" or content == "":
-                continue
-            collected.append({"role": role, "content": content})
-        if len(collected) > 0:
-            return collected
-
-    fallback = str(payload.get("message", "")).strip()
-    if fallback == "":
-        return [{"role": "user", "content": "Say hello and ask how to help."}]
-    return [{"role": "user", "content": fallback}]
+    return build_workflow_messages(payload)
 
 
 def _workflow_text_output(terminal_output: Any) -> str:
-    if terminal_output is None:
-        return ""
-    if isinstance(terminal_output, str):
-        return terminal_output
-    if isinstance(terminal_output, dict):
-        subject = terminal_output.get("subject")
-        body = terminal_output.get("body")
-        if isinstance(subject, str) and isinstance(body, str):
-            return f"Subject: {subject}\n\n{body}"
-    return str(terminal_output)
+    return workflow_text_output(terminal_output)
 
 
 def _extract_workflow_nerdstats(
     workflow_result: dict[str, Any],
 ) -> dict[str, Any] | None:
-    events = workflow_result.get("events")
-    if not isinstance(events, list):
-        return None
-
-    for event in reversed(events):
-        if not isinstance(event, dict):
-            continue
-        event_type = str(event.get("event_type", "")).strip()
-        if event_type != "workflow_completed":
-            continue
-        metadata = event.get("metadata")
-        if not isinstance(metadata, dict):
-            continue
-        nerdstats = metadata.get("nerdstats")
-        if isinstance(nerdstats, dict):
-            return nerdstats
-    return None
-
-
-def _count_workflow_events_by_type(workflow_result: dict[str, Any]) -> dict[str, int]:
-    events = workflow_result.get("events")
-    if not isinstance(events, list):
-        return {}
-
-    counts: dict[str, int] = {}
-    for event in events:
-        if not isinstance(event, dict):
-            continue
-        event_type = str(event.get("event_type", "")).strip()
-        if event_type == "":
-            continue
-        prior = counts.get(event_type, 0)
-        counts[event_type] = prior + 1
-    return counts
-
-
-def _build_trace_url(trace_id: str) -> str:
-    normalized_trace_id = trace_id.strip()
-    if normalized_trace_id == "":
-        return ""
-    base_url = os.getenv("TRACE_UI_BASE_URL", "http://localhost:16686").strip()
-    normalized_base_url = base_url.rstrip("/")
-    if normalized_base_url == "":
-        normalized_base_url = "http://localhost:16686"
-    return f"{normalized_base_url}/trace/{normalized_trace_id}"
+    return extract_workflow_nerdstats(workflow_result)
 
 
 def _build_chat_message_content(
     terminal_output: Any, workflow_result: dict[str, Any]
 ) -> dict[str, Any]:
-    content: dict[str, Any] = {
-        "reply": _workflow_text_output(terminal_output),
-        "terminal_output": terminal_output,
-        "workflow": {
-            "workflow_id": workflow_result.get("workflow_id"),
-            "terminal_node": workflow_result.get("terminal_node"),
-        },
-    }
-    return content
+    return build_chat_message_content(terminal_output, workflow_result)
 
 
 def _build_chat_message_metadata(
     req: InvokeRequest, workflow_result: dict[str, Any]
 ) -> dict[str, Any]:
-    trace_id = str(req.trace.trace_id).strip()
-    metadata: dict[str, Any] = {
-        "source": "runtime.workflow.invoke",
-        "workflow_id": workflow_result.get("workflow_id"),
-        "terminal_node": workflow_result.get("terminal_node"),
-        "trace": workflow_result.get("trace", []),
-        "step_timings": workflow_result.get("step_timings", []),
-        "event_counts": _count_workflow_events_by_type(workflow_result),
-        "nerdstats": _extract_workflow_nerdstats(workflow_result),
-        "llm_node_metrics": workflow_result.get("llm_node_metrics", {}),
-        "total_elapsed_ms": workflow_result.get("total_elapsed_ms"),
-        "trace_context": {
-            "trace_id": trace_id,
-            "span_id": str(req.trace.span_id).strip(),
-            "tenant_id": str(req.trace.tenant_id).strip(),
-            "trace_url": _build_trace_url(trace_id),
-        },
-    }
-    events = workflow_result.get("events")
-    if isinstance(events, list):
-        metadata["events"] = events
-    return metadata
-
-
-def _coerce_int(value: Any) -> int | None:
-    if isinstance(value, bool):
-        return None
-    if isinstance(value, int):
-        return value
-    if isinstance(value, float):
-        if value.is_integer():
-            return int(value)
-        return None
-    text = str(value).strip()
-    if text == "":
-        return None
-    if text.isdigit():
-        return int(text)
-    return None
+    return build_chat_message_metadata(req, workflow_result)
 
 
 def _token_metrics_from_nerdstats(nerdstats: Any) -> dict[str, int]:
-    if not isinstance(nerdstats, dict):
-        return {}
-    total_tokens = _coerce_int(nerdstats.get("total_tokens"))
-    prompt_tokens = _coerce_int(nerdstats.get("total_input_tokens"))
-    completion_tokens = _coerce_int(nerdstats.get("total_output_tokens"))
-
-    metrics: dict[str, int] = {}
-    if prompt_tokens is not None and prompt_tokens >= 0:
-        metrics["prompt_tokens"] = prompt_tokens
-    if completion_tokens is not None and completion_tokens >= 0:
-        metrics["completion_tokens"] = completion_tokens
-    if total_tokens is not None and total_tokens >= 0:
-        metrics["total_tokens"] = total_tokens
-    elif (
-        "prompt_tokens" in metrics
-        and "completion_tokens" in metrics
-        and metrics["prompt_tokens"] >= 0
-        and metrics["completion_tokens"] >= 0
-    ):
-        metrics["total_tokens"] = (
-            metrics["prompt_tokens"] + metrics["completion_tokens"]
-        )
-    return metrics
+    return token_metrics_from_nerdstats(nerdstats)
 
 
 def _resolve_chat_id(input_payload: dict[str, Any], fallback_run_id: str) -> str:
-    for candidate in (
-        input_payload.get("chat_id"),
-        input_payload.get("chatId"),
-        input_payload.get("conversation_id"),
-        input_payload.get("conversationId"),
-    ):
-        chat_id = str(candidate).strip()
-        if chat_id != "":
-            return chat_id
-    return fallback_run_id
+    return resolve_chat_id(input_payload, fallback_run_id)
 
 
 def _build_workflow_registry() -> dict[str, str]:
@@ -615,18 +490,7 @@ def _run_startup_bootstrap() -> None:
 
 
 def _read_auth_bearer_token(request: Request) -> str:
-    authorization = request.headers.get("authorization", "").strip()
-    if authorization == "":
-        return ""
-
-    parts = authorization.split(" ", 1)
-    if len(parts) != 2 or parts[0].strip().lower() != "bearer":
-        raise HTTPException(status_code=401, detail="invalid authorization header")
-
-    token = parts[1].strip()
-    if token == "":
-        raise HTTPException(status_code=401, detail="invalid authorization header")
-    return token
+    return read_auth_bearer_token(request)
 
 
 def _build_control_plane_client(
@@ -635,47 +499,21 @@ def _build_control_plane_client(
     require_bearer: bool = False,
     allow_api_token_fallback: bool = True,
 ) -> SimpleFlowClient:
-    if api_base_url == "":
-        raise HTTPException(
-            status_code=503,
-            detail="control plane is not configured; set SIMPLEFLOW_API_BASE_URL",
-        )
-
-    bearer_token = _read_auth_bearer_token(request)
-    if require_bearer and bearer_token == "":
-        raise HTTPException(status_code=401, detail="authorization required")
-
-    selected_token = bearer_token
-    if selected_token == "" and allow_api_token_fallback:
-        selected_token = api_token
-    return SimpleFlowClient(api_base_url, selected_token)
+    return build_control_plane_client(
+        request,
+        config=control_plane_config,
+        client_cls=SimpleFlowClient,
+        require_bearer=require_bearer,
+        allow_api_token_fallback=allow_api_token_fallback,
+    )
 
 
 def _control_plane_query_path(path: str, query: dict[str, Any]) -> str:
-    encoded = urlencode(query)
-    if encoded == "":
-        return path
-    return f"{path}?{encoded}"
+    return control_plane_query_path(path, query)
 
 
 def _map_control_plane_error(exc: Exception) -> HTTPException:
-    raw = str(exc).strip()
-    status_code = 502
-    detail = raw if raw != "" else "control-plane request failed"
-
-    if "status=" in raw:
-        try:
-            status_fragment = raw.split("status=", 1)[1].split(" ", 1)[0]
-            status_code = int(status_fragment)
-        except Exception:  # noqa: BLE001
-            status_code = 502
-
-    if "body=" in raw:
-        body = raw.split("body=", 1)[1].strip()
-        if body != "":
-            detail = body
-
-    return HTTPException(status_code=status_code, detail=detail)
+    return map_control_plane_error(exc)
 
 
 def _control_plane_get(
@@ -684,15 +522,13 @@ def _control_plane_get(
     path: str,
     require_bearer: bool = False,
 ) -> dict[str, Any]:
-    client = _build_control_plane_client(request, require_bearer=require_bearer)
-    try:
-        return client._get(path)
-    except HTTPException:
-        raise
-    except Exception as exc:  # noqa: BLE001
-        raise _map_control_plane_error(exc) from exc
-    finally:
-        client.close()
+    return control_plane_get(
+        request,
+        path=path,
+        config=control_plane_config,
+        client_cls=SimpleFlowClient,
+        require_bearer=require_bearer,
+    )
 
 
 def _control_plane_post(
@@ -703,19 +539,15 @@ def _control_plane_post(
     require_bearer: bool = False,
     allow_api_token_fallback: bool = True,
 ) -> dict[str, Any]:
-    client = _build_control_plane_client(
+    return control_plane_post(
         request,
+        path=path,
+        payload=payload,
+        config=control_plane_config,
+        client_cls=SimpleFlowClient,
         require_bearer=require_bearer,
         allow_api_token_fallback=allow_api_token_fallback,
     )
-    try:
-        return client._post(path, payload)
-    except HTTPException:
-        raise
-    except Exception as exc:  # noqa: BLE001
-        raise _map_control_plane_error(exc) from exc
-    finally:
-        client.close()
 
 
 def _control_plane_patch(
@@ -725,15 +557,14 @@ def _control_plane_patch(
     payload: dict[str, Any],
     require_bearer: bool = False,
 ) -> dict[str, Any]:
-    client = _build_control_plane_client(request, require_bearer=require_bearer)
-    try:
-        return client._patch(path, payload)
-    except HTTPException:
-        raise
-    except Exception as exc:  # noqa: BLE001
-        raise _map_control_plane_error(exc) from exc
-    finally:
-        client.close()
+    return control_plane_patch(
+        request,
+        path=path,
+        payload=payload,
+        config=control_plane_config,
+        client_cls=SimpleFlowClient,
+        require_bearer=require_bearer,
+    )
 
 
 def _control_plane_delete(
@@ -742,34 +573,13 @@ def _control_plane_delete(
     path: str,
     require_bearer: bool = False,
 ) -> dict[str, Any]:
-    client = _build_control_plane_client(request, require_bearer=require_bearer)
-    try:
-        normalized_path = path if path.startswith("/") else f"/{path}"
-        url = f"{api_base_url.rstrip('/')}{normalized_path}"
-        headers: dict[str, str] = {}
-        token = _read_auth_bearer_token(request)
-        if token != "":
-            headers["Authorization"] = f"Bearer {token}"
-        elif api_token != "":
-            headers["Authorization"] = f"Bearer {api_token}"
-
-        response = client._client.delete(url, headers=headers)
-        if response.status_code < 200 or response.status_code >= 300:
-            raise RuntimeError(
-                f"simpleflow sdk request error: status={response.status_code} body={response.text.strip()}"
-            )
-        if response.text.strip() == "":
-            return {}
-        decoded = response.json()
-        if isinstance(decoded, dict):
-            return decoded
-        return {}
-    except HTTPException:
-        raise
-    except Exception as exc:  # noqa: BLE001
-        raise _map_control_plane_error(exc) from exc
-    finally:
-        client.close()
+    return control_plane_delete(
+        request,
+        path=path,
+        config=control_plane_config,
+        client_cls=SimpleFlowClient,
+        require_bearer=require_bearer,
+    )
 
 
 def _require_operator_auth(request: Request) -> None:
@@ -891,44 +701,7 @@ def _normalize_runtime_registrations_payload(
 
 
 def _normalize_control_plane_me(payload: dict[str, Any]) -> dict[str, Any]:
-    normalized = dict(payload)
-    user_payload = payload.get("user")
-    user = user_payload if isinstance(user_payload, dict) else {}
-
-    user_id = ""
-    for candidate in (
-        payload.get("id"),
-        payload.get("user_id"),
-        payload.get("userId"),
-        payload.get("UserID"),
-        user.get("id"),
-        user.get("user_id"),
-        user.get("userId"),
-        user.get("UserID"),
-    ):
-        user_id = _read_non_empty_string(candidate)
-        if user_id != "":
-            break
-
-    organization_id = ""
-    for candidate in (
-        payload.get("organization_id"),
-        payload.get("organizationId"),
-        payload.get("OrganizationID"),
-        user.get("organization_id"),
-        user.get("organizationId"),
-        user.get("OrganizationID"),
-    ):
-        organization_id = _read_non_empty_string(candidate)
-        if organization_id != "":
-            break
-
-    if user_id != "":
-        normalized["id"] = user_id
-        normalized["user_id"] = user_id
-    if organization_id != "":
-        normalized["organization_id"] = organization_id
-    return normalized
+    return normalize_control_plane_me(payload, _read_non_empty_string)
 
 
 def _onboarding_state_from_catalog(item: dict[str, Any]) -> dict[str, Any]:
