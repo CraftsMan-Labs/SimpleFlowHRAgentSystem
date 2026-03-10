@@ -12,6 +12,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 
 def _install_test_stubs() -> None:
+    os.environ.setdefault("RUNTIME_CORS_ALLOW_ORIGINS", "http://localhost:5173")
+
     if "jwt" not in sys.modules:
         jwt_stub = types.ModuleType("jwt")
 
@@ -108,6 +110,16 @@ def _install_test_stubs() -> None:
         setattr(pydantic_stub, "BaseModel", BaseModel)
         setattr(pydantic_stub, "Field", Field)
         sys.modules["pydantic"] = pydantic_stub
+
+    if "pydantic_settings" not in sys.modules:
+        pydantic_settings_stub = types.ModuleType("pydantic_settings")
+        from pydantic import BaseModel as _BaseModel
+
+        class BaseSettings(_BaseModel):
+            pass
+
+        setattr(pydantic_settings_stub, "BaseSettings", BaseSettings)
+        sys.modules["pydantic_settings"] = pydantic_settings_stub
 
     if "simpleflow_sdk" not in sys.modules:
         sdk_stub = types.ModuleType("simpleflow_sdk")
