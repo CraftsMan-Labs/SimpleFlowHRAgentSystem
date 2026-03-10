@@ -114,6 +114,15 @@ Required networking notes:
 - Keep runtime and control-plane backends on the same Docker network.
 - Do not register runtime with localhost URL when control-plane backend is containerized.
 
+## Control-plane security config
+
+When this runtime is linked to a SimpleFlow control-plane backend, set these on the control-plane backend service:
+
+- `PUBLIC_BASE_URL` (example: `http://localhost:8080`) for stable invite URL generation.
+- `RUNTIME_ENDPOINT_ALLOWLIST` (example: `simpleflow-hr-runtime,localhost`) so runtime registration endpoints are explicitly allowed.
+
+If allowlist is enabled, ensure `RUNTIME_BOOTSTRAP_ENDPOINT_URL` host is included.
+
 ## Notes
 
 - Start the SimpleFlow stack first so external Docker network `simpleflow_default` exists.

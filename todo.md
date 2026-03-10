@@ -1,0 +1,8 @@
+- [x] Create strict settings model in `backend/config.py` with fail-fast validation.
+- [x] Disallow wildcard CORS and reject empty CORS allowlist at startup.
+- [x] Replace direct `os.getenv` calls with centralized settings usage.
+- [x] Refactor backend into compact OOD service modules with clear responsibilities.
+- [x] Keep file/folder structure modular without creating too many files.
+- [x] Update tests for settings and service behavior parity.
+- [x] Ensure code is pyright compliant.
+- [x] Run unit tests and static checks.

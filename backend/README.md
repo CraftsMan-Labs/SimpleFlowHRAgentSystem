@@ -93,6 +93,12 @@ HR runtime is expected to auto-onboard during backend startup. Set:
 
 When configured, runtime emits events/chat/queue writes to SimpleFlow APIs, gateway endpoints proxy control-plane requests through `SimpleFlowClient` with bearer-token passthrough, and onboarding lifecycle (`create -> validate -> activate`) uses SDK lifecycle helpers. With client credentials configured, the SDK auto-fetches short-lived access tokens from `/v1/oauth/token`.
 
+## Runtime CORS requirements
+
+- `RUNTIME_CORS_ALLOW_ORIGINS` is required and validated at startup.
+- Wildcard `*` is explicitly rejected.
+- Empty values are rejected.
+
 ## Tests
 
 ```bash
