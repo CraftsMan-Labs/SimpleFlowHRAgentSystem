@@ -66,10 +66,7 @@ Invoke trust is enabled in template examples.
 - `RUNTIME_INVOKE_TRUST_ENABLED=true`
 - `RUNTIME_INVOKE_TOKEN_ISSUER`
 - `RUNTIME_INVOKE_TOKEN_AUDIENCE`
-- Preferred (production): `RUNTIME_INVOKE_TOKEN_JWKS_URL` pointing to SimpleFlow runtime JWKS (`/.well-known/runtime-invoke-jwks.json`)
-- Legacy fallback: `RUNTIME_INVOKE_TOKEN_SIGNING_KEY` for HS256 shared-secret verification
-
-If both JWKS and signing key are set, JWKS verification is used.
+- `RUNTIME_INVOKE_TOKEN_JWKS_URL` pointing to SimpleFlow runtime JWKS (`/.well-known/runtime-invoke-jwks.json`)
 
 When enabled, `/invoke` requires `Authorization: Bearer <token>`.
 
