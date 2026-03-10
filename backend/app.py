@@ -13,7 +13,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from simpleflow_sdk import (
     ChatMessageWrite,
-    InvokeTokenVerifier,
     QueueContract,
     SimpleFlowAuthenticationError,
     SimpleFlowAuthorizationError,
@@ -74,7 +73,6 @@ class InvokeTrustConfig:
     enabled: bool
     issuer: str
     audience: str
-    signing_key: str
     jwks_url: str
 
 
@@ -143,7 +141,6 @@ def _build_invoke_trust_config() -> InvokeTrustConfig:
     enabled = current_settings.runtime_invoke_trust_enabled
     issuer = current_settings.runtime_invoke_token_issuer
     audience = current_settings.runtime_invoke_token_audience
-    signing_key = current_settings.runtime_invoke_token_signing_key
     jwks_url = current_settings.runtime_invoke_token_jwks_url
 
     if not enabled:
@@ -151,7 +148,6 @@ def _build_invoke_trust_config() -> InvokeTrustConfig:
             enabled=False,
             issuer=issuer,
             audience=audience,
-            signing_key=signing_key,
             jwks_url=jwks_url,
         )
 
@@ -163,30 +159,20 @@ def _build_invoke_trust_config() -> InvokeTrustConfig:
         raise ValueError(
             "RUNTIME_INVOKE_TOKEN_AUDIENCE is required when invoke trust is enabled"
         )
-    if signing_key == "" and jwks_url == "":
+    if jwks_url == "":
         raise ValueError(
-            "set RUNTIME_INVOKE_TOKEN_SIGNING_KEY or RUNTIME_INVOKE_TOKEN_JWKS_URL when invoke trust is enabled"
+            "set RUNTIME_INVOKE_TOKEN_JWKS_URL when invoke trust is enabled"
         )
 
     return InvokeTrustConfig(
         enabled=True,
         issuer=issuer,
         audience=audience,
-        signing_key=signing_key,
         jwks_url=jwks_url,
     )
 
 
 invoke_trust_config = _build_invoke_trust_config()
-shared_key_verifier = (
-    InvokeTokenVerifier(
-        issuer=invoke_trust_config.issuer,
-        audience=invoke_trust_config.audience,
-        algorithms=["HS256", "HS384", "HS512"],
-    )
-    if invoke_trust_config.enabled and invoke_trust_config.signing_key != ""
-    else None
-)
 jwks_client = (
     jwt.PyJWKClient(invoke_trust_config.jwks_url)
     if invoke_trust_config.enabled and invoke_trust_config.jwks_url != ""
@@ -225,8 +211,6 @@ def _verify_invoke_request(request: Request) -> InvokeScope:
                 options={"require": ["exp", "iat", "iss", "aud"]},
             )
             claims = decoded if isinstance(decoded, dict) else {}
-        elif shared_key_verifier is not None:
-            claims = shared_key_verifier.verify(token, invoke_trust_config.signing_key)
         else:
             raise ValueError("invoke trust verifier is not configured")
     except Exception as exc:  # noqa: BLE001

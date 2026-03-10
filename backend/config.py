@@ -35,7 +35,6 @@ class RuntimeSettings(BaseSettings):
     runtime_invoke_trust_enabled: bool = Field(default=False)
     runtime_invoke_token_issuer: str = Field(default="")
     runtime_invoke_token_audience: str = Field(default="")
-    runtime_invoke_token_signing_key: str = Field(default="")
     runtime_invoke_token_jwks_url: str = Field(default="")
 
     runtime_bootstrap_register_on_startup: bool = Field(default=False)
@@ -103,10 +102,6 @@ def get_settings() -> RuntimeSettings:
         ).strip(),
         runtime_invoke_token_audience=os.getenv(
             "RUNTIME_INVOKE_TOKEN_AUDIENCE", ""
-        ).strip(),
-        runtime_invoke_token_signing_key=os.getenv(
-            "RUNTIME_INVOKE_TOKEN_SIGNING_KEY",
-            "",
         ).strip(),
         runtime_invoke_token_jwks_url=os.getenv(
             "RUNTIME_INVOKE_TOKEN_JWKS_URL",
