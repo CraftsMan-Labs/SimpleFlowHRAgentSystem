@@ -995,7 +995,7 @@ def _run_onboarding_lifecycle(
     state["state"] = "in_progress"
     state["message"] = "Running runtime registration lifecycle."
     state["steps"] = {
-        "create": "running",
+        "create": "pending",
         "validate": "pending",
         "activate": "pending",
     }
@@ -1016,8 +1016,54 @@ def _run_onboarding_lifecycle(
 
     client = _build_machine_control_plane_client()
     try:
-        created = client.register_runtime(registration)
-        registration_id = _normalize_registration_id(created)
+        ensure_registration_active = getattr(
+            client, "ensure_runtime_registration_active", None
+        )
+        result: dict[str, Any]
+        if callable(ensure_registration_active):
+            ensured = ensure_registration_active(registration=registration)
+            if not isinstance(ensured, dict):
+                raise HTTPException(
+                    status_code=502,
+                    detail="registration lifecycle response must be an object",
+                )
+            result = ensured
+        else:
+            state["steps"]["create"] = "running"
+            created = client.register_runtime(registration)
+            registration_id = _normalize_registration_id(created)
+            if registration_id == "":
+                state["state"] = "failed"
+                state["steps"]["create"] = "failed"
+                raise HTTPException(
+                    status_code=502,
+                    detail="registration response missing registration id",
+                )
+
+            state["registration_id"] = registration_id
+            state["steps"]["create"] = "success"
+            state["steps"]["validate"] = "running"
+
+            validation = client.validate_runtime_registration(registration_id)
+            if (
+                isinstance(validation, dict)
+                and validation.get("validation_ok") is False
+            ):
+                raise HTTPException(
+                    status_code=502, detail="runtime registration validation failed"
+                )
+
+            state["steps"]["validate"] = "success"
+            state["steps"]["activate"] = "running"
+            client.activate_runtime_registration(registration_id)
+            result = {
+                "registration_id": registration_id,
+                "created": True,
+                "validated": True,
+                "activated": True,
+            }
+
+        registration_id = _normalize_registration_id(result)
         if registration_id == "":
             state["state"] = "failed"
             state["steps"]["create"] = "failed"
@@ -1027,21 +1073,18 @@ def _run_onboarding_lifecycle(
             )
 
         state["registration_id"] = registration_id
-        state["steps"]["create"] = "success"
-        state["steps"]["validate"] = "running"
-
-        validation = client.validate_runtime_registration(registration_id)
-        if isinstance(validation, dict) and validation.get("validation_ok") is False:
-            raise HTTPException(
-                status_code=502, detail="runtime registration validation failed"
-            )
-
-        state["steps"]["validate"] = "success"
-        state["steps"]["activate"] = "running"
-        client.activate_runtime_registration(registration_id)
-        result = {
-            "registration_id": registration_id,
-        }
+        if result.get("created") is True:
+            state["steps"]["create"] = "success"
+        else:
+            state["steps"]["create"] = "skipped"
+        if result.get("validated") is True:
+            state["steps"]["validate"] = "success"
+        else:
+            state["steps"]["validate"] = "skipped"
+        if result.get("activated") is True:
+            state["steps"]["activate"] = "success"
+        else:
+            state["steps"]["activate"] = "skipped"
     except SimpleFlowAuthenticationError as exc:
         state["state"] = "blocked"
         state["message"] = "machine auth failed for onboarding lifecycle"
@@ -1064,9 +1107,6 @@ def _run_onboarding_lifecycle(
         client.close()
 
     state["registration_id"] = str(result.get("registration_id", "")).strip()
-    state["steps"]["create"] = "success"
-    state["steps"]["validate"] = "success"
-    state["steps"]["activate"] = "success"
     state["state"] = "active"
     state["message"] = "Runtime registration is active."
     return state

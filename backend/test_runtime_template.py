@@ -563,6 +563,62 @@ class RuntimeTemplateTests(unittest.TestCase):
         self.assertEqual(result["state"], "in_progress")
         self.assertEqual(result["registration_id"], "reg_unknown")
 
+    def test_onboarding_lifecycle_reuses_existing_registration(self) -> None:
+        _install_test_stubs()
+        os.environ["RUNTIME_INVOKE_TRUST_ENABLED"] = "false"
+        import app as runtime_app
+
+        runtime_app = importlib.reload(runtime_app)
+
+        class _LifecycleClient:
+            def __init__(self) -> None:
+                self.ensure_calls = 0
+                self.register_calls = 0
+
+            def ensure_runtime_registration_active(self, registration):
+                self.ensure_calls += 1
+                return {
+                    "status": "active",
+                    "registration_id": "reg_existing",
+                    "created": False,
+                    "validated": True,
+                    "activated": True,
+                }
+
+            def register_runtime(self, registration):
+                self.register_calls += 1
+                return {"id": "reg_new"}
+
+            def close(self):
+                return None
+
+        original_builder = runtime_app._build_machine_control_plane_client
+        fake_client = _LifecycleClient()
+        setattr(
+            runtime_app,
+            "_build_machine_control_plane_client",
+            lambda: fake_client,
+        )
+        try:
+            result = runtime_app._run_onboarding_lifecycle(
+                runtime_app.agent_id,
+                runtime_app.agent_version,
+            )
+        finally:
+            setattr(
+                runtime_app,
+                "_build_machine_control_plane_client",
+                original_builder,
+            )
+
+        self.assertEqual(result["state"], "active")
+        self.assertEqual(result["registration_id"], "reg_existing")
+        self.assertEqual(result["steps"]["create"], "skipped")
+        self.assertEqual(result["steps"]["validate"], "success")
+        self.assertEqual(result["steps"]["activate"], "success")
+        self.assertEqual(fake_client.ensure_calls, 1)
+        self.assertEqual(fake_client.register_calls, 0)
+
     def test_control_plane_me_normalizes_user_and_org_ids(self) -> None:
         _install_test_stubs()
         os.environ["RUNTIME_INVOKE_TRUST_ENABLED"] = "false"
