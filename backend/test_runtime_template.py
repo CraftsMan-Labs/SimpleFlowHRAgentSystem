@@ -322,8 +322,9 @@ class RuntimeTemplateTests(unittest.TestCase):
         os.environ["RUNTIME_INVOKE_TRUST_ENABLED"] = "true"
         os.environ.pop("RUNTIME_INVOKE_TOKEN_ISSUER", None)
         os.environ["RUNTIME_INVOKE_TOKEN_AUDIENCE"] = "runtime"
-        os.environ["RUNTIME_INVOKE_TOKEN_SIGNING_KEY"] = "secret"
-        os.environ.pop("RUNTIME_INVOKE_TOKEN_JWKS_URL", None)
+        os.environ["RUNTIME_INVOKE_TOKEN_JWKS_URL"] = (
+            "http://backend:8080/.well-known/runtime-invoke-jwks.json"
+        )
 
         with self.assertRaises(ValueError):
             runtime_app._build_invoke_trust_config()
@@ -363,7 +364,7 @@ class RuntimeTemplateTests(unittest.TestCase):
             ),
         )
 
-    def test_trust_config_allows_jwks_and_signing_key(self) -> None:
+    def test_trust_config_requires_jwks_url_when_enabled(self) -> None:
         _install_test_stubs()
         os.environ["RUNTIME_INVOKE_TRUST_ENABLED"] = "false"
         import app as runtime_app
@@ -372,7 +373,20 @@ class RuntimeTemplateTests(unittest.TestCase):
         os.environ["RUNTIME_INVOKE_TRUST_ENABLED"] = "true"
         os.environ["RUNTIME_INVOKE_TOKEN_ISSUER"] = "simpleflow-runtime"
         os.environ["RUNTIME_INVOKE_TOKEN_AUDIENCE"] = "simpleflow-runtime"
-        os.environ["RUNTIME_INVOKE_TOKEN_SIGNING_KEY"] = "legacy-secret"
+        os.environ.pop("RUNTIME_INVOKE_TOKEN_JWKS_URL", None)
+
+        with self.assertRaises(ValueError):
+            runtime_app._build_invoke_trust_config()
+
+    def test_trust_config_accepts_jwks_url_when_enabled(self) -> None:
+        _install_test_stubs()
+        os.environ["RUNTIME_INVOKE_TRUST_ENABLED"] = "false"
+        import app as runtime_app
+
+        runtime_app = importlib.reload(runtime_app)
+        os.environ["RUNTIME_INVOKE_TRUST_ENABLED"] = "true"
+        os.environ["RUNTIME_INVOKE_TOKEN_ISSUER"] = "simpleflow-runtime"
+        os.environ["RUNTIME_INVOKE_TOKEN_AUDIENCE"] = "simpleflow-runtime"
         os.environ["RUNTIME_INVOKE_TOKEN_JWKS_URL"] = (
             "http://backend:8080/.well-known/runtime-invoke-jwks.json"
         )
@@ -381,21 +395,13 @@ class RuntimeTemplateTests(unittest.TestCase):
         self.assertEqual(
             config.jwks_url, "http://backend:8080/.well-known/runtime-invoke-jwks.json"
         )
-        self.assertEqual(config.signing_key, "legacy-secret")
 
-    def test_verify_invoke_prefers_jwks_when_configured(self) -> None:
+    def test_verify_invoke_uses_jwks_when_configured(self) -> None:
         _install_test_stubs()
         os.environ["RUNTIME_INVOKE_TRUST_ENABLED"] = "false"
         import app as runtime_app
 
         runtime_app = importlib.reload(runtime_app)
-
-        class _SharedVerifier:
-            called = False
-
-            def verify(self, token: str, key: str):
-                self.called = True
-                raise AssertionError("shared verifier should not be called")
 
         class _JWKSClient:
             called = False
@@ -415,11 +421,9 @@ class RuntimeTemplateTests(unittest.TestCase):
                 enabled=True,
                 issuer="simpleflow-runtime",
                 audience="simpleflow-runtime",
-                signing_key="legacy-secret",
                 jwks_url="http://backend:8080/.well-known/runtime-invoke-jwks.json",
             ),
         )
-        setattr(runtime_app, "shared_key_verifier", _SharedVerifier())
         setattr(runtime_app, "jwks_client", _JWKSClient())
         runtime_app.jwt.decode = lambda *args, **kwargs: {
             "agent_id": "agent_1",
@@ -434,9 +438,7 @@ class RuntimeTemplateTests(unittest.TestCase):
         scope = runtime_app._verify_invoke_request(request)
         self.assertEqual(scope.agent_id, "agent_1")
         jwks_client = getattr(runtime_app, "jwks_client")
-        shared_key_verifier = getattr(runtime_app, "shared_key_verifier")
         self.assertTrue(jwks_client.called)
-        self.assertFalse(shared_key_verifier.called)
 
     def test_build_workflow_messages_prefers_messages_array(self) -> None:
         _install_test_stubs()
