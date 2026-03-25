@@ -24,24 +24,23 @@ class RuntimeService:
                 detail="simple_agents_py is not installed; install it before invoking workflows",
             ) from exc
 
-        if self._settings.custom_api_key != "":
-            os.environ.setdefault("CUSTOM_API_KEY", self._settings.custom_api_key)
-        if self._settings.custom_api_base != "":
-            os.environ.setdefault("CUSTOM_API_BASE", self._settings.custom_api_base)
+        api_key = self._settings.custom_api_key.strip()
+        if api_key == "":
+            api_key = os.getenv("WORKFLOW_API_KEY", "").strip()
+        api_base = self._settings.custom_api_base.strip()
+        if api_base == "":
+            api_base = os.getenv("WORKFLOW_API_BASE", "").strip()
+
+        if api_key != "":
+            os.environ.setdefault("CUSTOM_API_KEY", api_key)
+        if api_base != "":
+            os.environ.setdefault("CUSTOM_API_BASE", api_base)
 
         try:
             return Client(
                 self._settings.simple_agents_provider,
-                api_base=(
-                    self._settings.custom_api_base
-                    if self._settings.custom_api_base != ""
-                    else None
-                ),
-                api_key=(
-                    self._settings.custom_api_key
-                    if self._settings.custom_api_key != ""
-                    else None
-                ),
+                api_base=(api_base if api_base != "" else None),
+                api_key=(api_key if api_key != "" else None),
             )
         except Exception as exc:  # noqa: BLE001
             raise HTTPException(
@@ -80,6 +79,12 @@ class RuntimeService:
             "trace": {"tenant": {"run_id": req.run_id}},
             "telemetry": {"nerdstats": True},
         }
+        configured_model = (
+            os.getenv("WORKFLOW_API_MODEL", "").strip()
+            or os.getenv("WORKFLOW_MODEL", "").strip()
+        )
+        if configured_model != "":
+            workflow_options["model"] = configured_model
         try:
             return workflow_client.run_workflow_yaml(
                 str(self.workflow_path),

@@ -19,6 +19,7 @@ class RuntimeSettings(BaseSettings):
     simpleflow_api_token: str = Field(default="")
     simpleflow_client_id: str = Field(default="")
     simpleflow_client_secret: str = Field(default="")
+    simpleflow_runtime_register_path: str = Field(default="/v1/runtime/connect")
 
     workflow_root: Path = Field(
         default_factory=lambda: (
@@ -42,6 +43,7 @@ class RuntimeSettings(BaseSettings):
     runtime_bootstrap_activate_registration: bool = Field(default=False)
     runtime_bootstrap_execution_mode: str = Field(default="remote_runtime")
     runtime_bootstrap_endpoint_url: str = Field(default="")
+    runtime_public_base_url: str = Field(default="")
     runtime_bootstrap_auth_mode: str = Field(default="jwt")
     runtime_bootstrap_runtime_id: str = Field(default="")
     runtime_bootstrap_registration_id: str = Field(default="")
@@ -81,6 +83,10 @@ def get_settings() -> RuntimeSettings:
         simpleflow_api_token=os.getenv("SIMPLEFLOW_API_TOKEN", "").strip(),
         simpleflow_client_id=os.getenv("SIMPLEFLOW_CLIENT_ID", "").strip(),
         simpleflow_client_secret=os.getenv("SIMPLEFLOW_CLIENT_SECRET", "").strip(),
+        simpleflow_runtime_register_path=(
+            os.getenv("SIMPLEFLOW_RUNTIME_REGISTER_PATH", "/v1/runtime/connect").strip()
+            or "/v1/runtime/connect"
+        ),
         workflow_root=Path(
             os.getenv(
                 "WORKFLOW_ROOT",
@@ -127,6 +133,7 @@ def get_settings() -> RuntimeSettings:
             "RUNTIME_BOOTSTRAP_ENDPOINT_URL",
             "",
         ).strip(),
+        runtime_public_base_url=os.getenv("RUNTIME_PUBLIC_BASE_URL", "").strip(),
         runtime_bootstrap_auth_mode=(
             os.getenv("RUNTIME_BOOTSTRAP_AUTH_MODE", "jwt").strip() or "jwt"
         ),

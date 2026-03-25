@@ -21,7 +21,7 @@ The frontend never calls control-plane URLs directly. It calls backend-local gat
 - `POST /api/control-plane/auth/sessions`
 - `DELETE /api/control-plane/auth/sessions/current`
 - `GET /api/control-plane/me`
-- `GET /api/control-plane/runtime/registrations`
+- `POST /api/control-plane/runtime/connect`
 - `POST /api/control-plane/runtime/invoke`
 - `GET /api/control-plane/chat/history/sessions`
 - `GET /api/control-plane/chat/history/messages`
@@ -29,6 +29,8 @@ The frontend never calls control-plane URLs directly. It calls backend-local gat
 - `PATCH /api/control-plane/chat/history/messages/{message_id}`
 
 Backend then calls control-plane APIs through `SimpleFlowClient` with incoming bearer-token passthrough.
+Runtime onboarding path is configurable with `SIMPLEFLOW_RUNTIME_REGISTER_PATH` (default: `/v1/runtime/connect`).
+`POST /api/control-plane/runtime/invoke` executes the local workflow runtime directly (it does not proxy to control-plane `/v1/runtime/invoke`). Control-plane event/chat writes from this endpoint try the signed-in user bearer token first, then fall back to machine-client credentials when needed.
 
 Canonical onboarding endpoints exposed by template backend:
 
@@ -46,9 +48,7 @@ Additional helper endpoints:
 ## Quick start
 
 ```bash
-cp backend/.env.example backend/.env
-cp frontend/.env.example frontend/.env
-docker compose build hr-backend hr-frontend
+cp .env.example .env
 make up
 ```
 
@@ -81,7 +81,7 @@ Use `make logs` to stream both services and `make down` to stop them.
 
 ## Workflows
 
-Configured by env vars in `backend/.env`:
+Configured by env vars in `.env`:
 
 - `WORKFLOW_ROOT=/workspace/workflows`
 - `WORKFLOW_ENTRY_FILE=email-chat-orchestrator-with-subgraph-tool.yaml`
@@ -89,6 +89,13 @@ Configured by env vars in `backend/.env`:
 `/invoke` converts runtime input into workflow `input.messages`, executes the selected YAML graph via `simple_agents_py`, and returns terminal output as `output.reply`.
 
 If provider credentials are not set (`CUSTOM_API_KEY` or provider-specific env vars), `/invoke` returns `503` with a configuration hint.
+
+## Onboarding behavior
+
+- `GET /api/onboarding/status` is read-only and does not create registrations.
+- Use `POST /api/onboarding/start` or `POST /api/onboarding/retry` to run onboarding lifecycle.
+- Onboarding lifecycle uses machine client credentials and `/v1/runtime/connect`.
+- `RUNTIME_BOOTSTRAP_RUNTIME_ID` must match the machine client's `RuntimeID` in control plane.
 
 ## Local verification
 

@@ -14,10 +14,7 @@ from pydantic import BaseModel, Field
 from simpleflow_sdk import (
     ChatMessageWrite,
     QueueContract,
-    SimpleFlowAuthenticationError,
-    SimpleFlowAuthorizationError,
     SimpleFlowClient,
-    SimpleFlowLifecycleError,
 )
 from config import get_settings
 from runtime_helpers.control_plane import (
@@ -100,6 +97,7 @@ api_base_url = settings.simpleflow_api_base_url
 api_token = settings.simpleflow_api_token
 machine_client_id = settings.simpleflow_client_id
 machine_client_secret = settings.simpleflow_client_secret
+runtime_register_path = settings.simpleflow_runtime_register_path
 control_plane_config = ControlPlaneConfig(
     api_base_url=api_base_url, api_token=api_token
 )
@@ -109,8 +107,21 @@ sdk_client = (
         api_token=api_token,
         oauth_client_id=machine_client_id,
         oauth_client_secret=machine_client_secret,
+        runtime_register_path=runtime_register_path,
     )
     if api_base_url
+    else None
+)
+
+runtime_machine_write_client = (
+    SimpleFlowClient(
+        api_base_url,
+        api_token=None,
+        oauth_client_id=machine_client_id,
+        oauth_client_secret=machine_client_secret,
+        runtime_register_path=runtime_register_path,
+    )
+    if api_base_url and machine_client_id != "" and machine_client_secret != ""
     else None
 )
 
@@ -288,28 +299,37 @@ def _run_agent_workflow(req: InvokeRequest) -> dict[str, Any]:
 
 
 def _run_startup_bootstrap() -> None:
-    if sdk_client is None:
+    bootstrap_client = runtime_machine_write_client or sdk_client
+    if bootstrap_client is None:
         return
     if not settings.runtime_bootstrap_register_on_startup:
         return
 
+    uses_connect_path = (
+        runtime_register_path.strip().lower().endswith("/runtime/connect")
+    )
     registration = {
         "agent_id": agent_id,
         "agent_version": agent_version,
-        "execution_mode": settings.runtime_bootstrap_execution_mode,
         "endpoint_url": settings.runtime_bootstrap_endpoint_url,
         "auth_mode": settings.runtime_bootstrap_auth_mode,
         "capabilities": ["chat", "webhook", "queue"],
         "runtime_id": settings.runtime_bootstrap_runtime_id,
     }
+    if not uses_connect_path:
+        registration["execution_mode"] = settings.runtime_bootstrap_execution_mode
 
     try:
-        created = sdk_client.register_runtime(registration)
+        created = bootstrap_client.register_runtime(registration)
         logger.info(
             "runtime bootstrap register succeeded for %s@%s", agent_id, agent_version
         )
     except Exception as exc:  # noqa: BLE001
         logger.warning("runtime bootstrap register failed: %s", exc)
+        return
+
+    if uses_connect_path:
+        logger.info("runtime bootstrap connect mode enabled; validate/activate skipped")
         return
 
     registration_id = _normalize_registration_id(created)
@@ -323,14 +343,14 @@ def _run_startup_bootstrap() -> None:
 
     if settings.runtime_bootstrap_validate_registration:
         try:
-            sdk_client.validate_runtime_registration(registration_id)
+            bootstrap_client.validate_runtime_registration(registration_id)
             logger.info("runtime bootstrap validate succeeded")
         except Exception as exc:  # noqa: BLE001
             logger.warning("runtime bootstrap validate failed: %s", exc)
 
     if settings.runtime_bootstrap_activate_registration:
         try:
-            sdk_client.activate_runtime_registration(registration_id)
+            bootstrap_client.activate_runtime_registration(registration_id)
             logger.info("runtime bootstrap activate succeeded")
         except Exception as exc:  # noqa: BLE001
             logger.warning("runtime bootstrap activate failed: %s", exc)
@@ -490,127 +510,10 @@ def _run_onboarding_lifecycle(
     runtime_agent_id: str,
     runtime_agent_version: str,
 ) -> dict[str, Any]:
-    _require_known_agent(runtime_agent_id, runtime_agent_version)
-    state = _get_or_create_onboarding_state(runtime_agent_id, runtime_agent_version)
-    state["state"] = "in_progress"
-    state["message"] = "Running runtime registration lifecycle."
-    state["steps"] = {
-        "create": "pending",
-        "validate": "pending",
-        "activate": "pending",
-    }
-
-    config = _find_agent_config(runtime_agent_id, runtime_agent_version)
-    if config is None:
-        raise HTTPException(status_code=404, detail="agent is not available in catalog")
-
-    registration = {
-        "agent_id": runtime_agent_id,
-        "agent_version": runtime_agent_version,
-        "execution_mode": "remote_runtime",
-        "endpoint_url": str(config.get("endpoint_url", "")).strip(),
-        "auth_mode": "jwt",
-        "capabilities": ["chat", "webhook", "queue"],
-        "runtime_id": str(config.get("runtime_id", "")).strip(),
-    }
-
-    client = _build_machine_control_plane_client()
-    try:
-        ensure_registration_active = getattr(
-            client, "ensure_runtime_registration_active", None
-        )
-        result: dict[str, Any]
-        if callable(ensure_registration_active):
-            ensured = ensure_registration_active(registration=registration)
-            if not isinstance(ensured, dict):
-                raise HTTPException(
-                    status_code=502,
-                    detail="registration lifecycle response must be an object",
-                )
-            result = ensured
-        else:
-            state["steps"]["create"] = "running"
-            created = client.register_runtime(registration)
-            registration_id = _normalize_registration_id(created)
-            if registration_id == "":
-                state["state"] = "failed"
-                state["steps"]["create"] = "failed"
-                raise HTTPException(
-                    status_code=502,
-                    detail="registration response missing registration id",
-                )
-
-            state["registration_id"] = registration_id
-            state["steps"]["create"] = "success"
-            state["steps"]["validate"] = "running"
-
-            validation = client.validate_runtime_registration(registration_id)
-            if (
-                isinstance(validation, dict)
-                and validation.get("validation_ok") is False
-            ):
-                raise HTTPException(
-                    status_code=502,
-                    detail="runtime registration validation failed",
-                )
-
-            state["steps"]["validate"] = "success"
-            state["steps"]["activate"] = "running"
-            client.activate_runtime_registration(registration_id)
-            result = {
-                "registration_id": registration_id,
-                "created": True,
-                "validated": True,
-                "activated": True,
-            }
-
-        registration_id = _normalize_registration_id(result)
-        if registration_id == "":
-            state["state"] = "failed"
-            state["steps"]["create"] = "failed"
-            raise HTTPException(
-                status_code=502,
-                detail="registration response missing registration id",
-            )
-
-        state["registration_id"] = registration_id
-        if result.get("created") is True:
-            state["steps"]["create"] = "success"
-        else:
-            state["steps"]["create"] = "skipped"
-        if result.get("validated") is True:
-            state["steps"]["validate"] = "success"
-        else:
-            state["steps"]["validate"] = "skipped"
-        if result.get("activated") is True:
-            state["steps"]["activate"] = "success"
-        else:
-            state["steps"]["activate"] = "skipped"
-    except SimpleFlowAuthenticationError as exc:
-        state["state"] = "blocked"
-        state["message"] = "machine auth failed for onboarding lifecycle"
-        state["steps"]["create"] = "failed"
-        raise HTTPException(status_code=401, detail=str(exc)) from exc
-    except SimpleFlowAuthorizationError as exc:
-        state["state"] = "blocked"
-        state["message"] = "machine token lacks lifecycle scope"
-        state["steps"]["create"] = "failed"
-        raise HTTPException(status_code=403, detail=str(exc)) from exc
-    except SimpleFlowLifecycleError as exc:
-        state["state"] = "failed"
-        state["message"] = str(exc)
-        raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
-    except Exception as exc:  # noqa: BLE001
-        state["state"] = "failed"
-        state["message"] = str(exc)
-        raise _map_control_plane_error(exc) from exc
-    finally:
-        client.close()
-
-    state["registration_id"] = str(result.get("registration_id", "")).strip()
-    state["state"] = "active"
-    state["message"] = "Runtime registration is active."
-    return state
+    return onboarding_service.run_onboarding_lifecycle(
+        runtime_agent_id,
+        runtime_agent_version,
+    )
 
 
 def _onboarding_public_view(state: dict[str, Any]) -> dict[str, Any]:
@@ -760,21 +663,6 @@ def onboarding_status(
     runtime_agent_id = agent_id.strip() or settings.runtime_agent_id
     runtime_agent_version = agent_version.strip() or settings.runtime_agent_version
     state = _get_or_create_onboarding_state(runtime_agent_id, runtime_agent_version)
-    state = _sync_onboarding_state_from_control_plane(state, request)
-    if str(state.get("state", "")).strip().lower() == "not_started":
-        try:
-            state = _run_onboarding_lifecycle(runtime_agent_id, runtime_agent_version)
-        except HTTPException as exc:
-            if exc.status_code == 401:
-                state["state"] = "blocked"
-                state["message"] = "machine auth failed for onboarding lifecycle"
-            elif exc.status_code == 403:
-                state["state"] = "blocked"
-                state["message"] = "machine token lacks lifecycle scope"
-            else:
-                state["state"] = "failed"
-                detail = str(exc.detail).strip()
-                state["message"] = detail if detail != "" else "onboarding failed"
     return _onboarding_public_view(state)
 
 
@@ -814,36 +702,54 @@ def control_plane_me(request: Request) -> dict[str, Any]:
     return _normalize_control_plane_me(payload)
 
 
-@app.get("/api/control-plane/runtime/registrations")
-def control_plane_runtime_registrations(
-    request: Request,
-    agent_id: str,
-    agent_version: str,
+@app.post("/api/control-plane/runtime/connect")
+def control_plane_runtime_connect(
+    payload: dict[str, Any], request: Request
 ) -> dict[str, Any]:
-    _require_known_agent(agent_id, agent_version)
-    path = _control_plane_query_path(
-        "/v1/runtime/registrations",
-        {
-            "agent_id": agent_id,
-            "agent_version": agent_version,
-        },
+    payload_agent_id = str(payload.get("agent_id", "")).strip()
+    payload_agent_version = str(payload.get("agent_version", "")).strip()
+    _require_known_agent(payload_agent_id, payload_agent_version)
+    return _control_plane_post(
+        request,
+        path="/v1/runtime/connect",
+        payload=payload,
+        require_bearer=True,
     )
-    return _control_plane_get(request, path=path, require_bearer=True)
+
+
+@app.get("/api/control-plane/runtime/registrations")
+def control_plane_runtime_registrations_deprecated() -> dict[str, Any]:
+    raise HTTPException(
+        status_code=410,
+        detail="runtime registrations API is deprecated; use /api/control-plane/runtime/connect",
+    )
 
 
 @app.post("/api/control-plane/runtime/invoke")
 def control_plane_runtime_invoke(
     payload: dict[str, Any], request: Request
 ) -> dict[str, Any]:
-    invoke_agent_id = str(payload.get("agent_id", "")).strip()
-    invoke_agent_version = str(payload.get("agent_version", "")).strip()
+    _require_operator_auth(request)
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="invalid invoke payload")
+
+    try:
+        req = InvokeRequest(**payload)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(
+            status_code=400, detail=f"invalid invoke payload: {exc}"
+        ) from exc
+
+    invoke_agent_id = str(req.agent_id).strip()
+    invoke_agent_version = str(req.agent_version).strip()
     _require_known_agent(invoke_agent_id, invoke_agent_version)
-    return _control_plane_post(
-        request,
-        path="/v1/runtime/invoke",
-        payload=payload,
-        require_bearer=True,
+
+    local_scope = InvokeScope(
+        agent_id=invoke_agent_id,
+        org_id=str(req.trace.tenant_id).strip(),
+        run_id=str(req.run_id).strip(),
     )
+    return _execute_invoke(req, request, local_scope)
 
 
 @app.get("/api/control-plane/chat/history/sessions")
@@ -918,11 +824,11 @@ def control_plane_patch_chat_history_message(
     )
 
 
-@app.post("/invoke")
-def invoke(req: InvokeRequest, request: Request) -> dict[str, Any]:
-    scope = _verify_invoke_request(request)
-    _validate_scope_against_request(req, scope)
-
+def _execute_invoke(
+    req: InvokeRequest,
+    request: Request,
+    scope: InvokeScope,
+) -> dict[str, Any]:
     if req.mode not in {"realtime", "batch"}:
         raise HTTPException(status_code=400, detail="mode must be realtime or batch")
 
@@ -949,81 +855,95 @@ def invoke(req: InvokeRequest, request: Request) -> dict[str, Any]:
     if isinstance(trace_context, dict):
         trace_url = str(trace_context.get("trace_url", "")).strip()
 
-    runtime_write_client: SimpleFlowClient | None = None
-    if sdk_client is not None:
-        try:
-            runtime_write_client = _build_control_plane_client(
-                request,
-                require_bearer=True,
-                allow_api_token_fallback=False,
+    def _write_runtime_outputs(runtime_write_client: SimpleFlowClient) -> None:
+        runtime_write_client.write_event(
+            {
+                "event_type": "runtime.invoke.completed",
+                "agent_id": scoped_agent_id,
+                "organization_id": scoped_org_id,
+                "run_id": scoped_run_id,
+                "trace_id": str(req.trace.trace_id).strip(),
+                "conversation_id": chat_id,
+                "request_id": str(req.trace.span_id).strip() or scoped_run_id,
+                "idempotency_key": event_idempotency_key,
+                "payload": {
+                    "status": "ok",
+                    "workflow_id": workflow_result.get("workflow_id"),
+                    "terminal_node": workflow_result.get("terminal_node"),
+                    "trace_id": req.trace.trace_id,
+                    "trace_url": trace_url,
+                    "event_counts": chat_message_metadata.get("event_counts", {}),
+                    "nerdstats": chat_message_metadata.get("nerdstats"),
+                    "metrics": token_metrics,
+                },
+            }
+        )
+        write_from_workflow = getattr(
+            runtime_write_client, "write_chat_message_from_workflow_result", None
+        )
+        if callable(write_from_workflow):
+            write_from_workflow(
+                agent_id=scoped_agent_id,
+                organization_id=scoped_org_id,
+                run_id=scoped_run_id,
+                role="assistant",
+                workflow_result=workflow_result,
+                trace_id=str(req.trace.trace_id).strip(),
+                span_id=str(req.trace.span_id).strip(),
+                tenant_id=str(req.trace.tenant_id).strip(),
+                chat_id=chat_id,
+                message_id=message_id,
+                direction="outbound",
+                created_at_ms=now_ms,
+                idempotency_key=chat_idempotency_key,
             )
-        except Exception:
-            runtime_write_client = sdk_client
-
-    if runtime_write_client is not None:
-        try:
-            runtime_write_client.write_event(
-                {
-                    "event_type": "runtime.invoke.completed",
-                    "agent_id": scoped_agent_id,
-                    "organization_id": scoped_org_id,
-                    "run_id": scoped_run_id,
-                    "trace_id": str(req.trace.trace_id).strip(),
-                    "conversation_id": chat_id,
-                    "request_id": str(req.trace.span_id).strip() or scoped_run_id,
-                    "idempotency_key": event_idempotency_key,
-                    "payload": {
-                        "status": "ok",
-                        "workflow_id": workflow_result.get("workflow_id"),
-                        "terminal_node": workflow_result.get("terminal_node"),
-                        "trace_id": req.trace.trace_id,
-                        "trace_url": trace_url,
-                        "event_counts": chat_message_metadata.get("event_counts", {}),
-                        "nerdstats": chat_message_metadata.get("nerdstats"),
-                        "metrics": token_metrics,
-                    },
-                }
-            )
-            write_from_workflow = getattr(
-                runtime_write_client, "write_chat_message_from_workflow_result", None
-            )
-            if callable(write_from_workflow):
-                write_from_workflow(
+        else:
+            runtime_write_client.write_chat_message(
+                ChatMessageWrite(
                     agent_id=scoped_agent_id,
                     organization_id=scoped_org_id,
                     run_id=scoped_run_id,
-                    role="assistant",
-                    workflow_result=workflow_result,
-                    trace_id=str(req.trace.trace_id).strip(),
-                    span_id=str(req.trace.span_id).strip(),
-                    tenant_id=str(req.trace.tenant_id).strip(),
                     chat_id=chat_id,
                     message_id=message_id,
+                    role="assistant",
                     direction="outbound",
-                    created_at_ms=now_ms,
+                    content=chat_message_content,
+                    metadata=chat_message_metadata,
                     idempotency_key=chat_idempotency_key,
+                    created_at_ms=now_ms,
                 )
-            else:
-                runtime_write_client.write_chat_message(
-                    ChatMessageWrite(
-                        agent_id=scoped_agent_id,
-                        organization_id=scoped_org_id,
-                        run_id=scoped_run_id,
-                        chat_id=chat_id,
-                        message_id=message_id,
-                        role="assistant",
-                        direction="outbound",
-                        content=chat_message_content,
-                        metadata=chat_message_metadata,
-                        idempotency_key=chat_idempotency_key,
-                        created_at_ms=now_ms,
-                    )
+            )
+
+    write_clients: list[tuple[str, SimpleFlowClient]] = []
+    ephemeral_clients: list[SimpleFlowClient] = []
+
+    try:
+        user_write_client = _build_control_plane_client(
+            request,
+            require_bearer=True,
+            allow_api_token_fallback=False,
+        )
+        write_clients.append(("user-token", user_write_client))
+        ephemeral_clients.append(user_write_client)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("runtime SDK write via user-token unavailable: %s", exc)
+
+    if runtime_machine_write_client is not None:
+        write_clients.append(("machine-client", runtime_machine_write_client))
+
+    for label, client in write_clients:
+        try:
+            _write_runtime_outputs(client)
+            if label == "machine-client":
+                logger.warning(
+                    "runtime SDK writes succeeded via machine-client fallback"
                 )
+            break
         except Exception as exc:  # noqa: BLE001
-            logger.warning("runtime SDK write skipped: %s", exc)
-        finally:
-            if runtime_write_client is not sdk_client:
-                runtime_write_client.close()
+            logger.warning("runtime SDK write via %s failed: %s", label, exc)
+
+    for client in ephemeral_clients:
+        client.close()
 
     return {
         "schema_version": "v1",
@@ -1043,6 +963,13 @@ def invoke(req: InvokeRequest, request: Request) -> dict[str, Any]:
             "duration_ms": 1,
         },
     }
+
+
+@app.post("/invoke")
+def invoke(req: InvokeRequest, request: Request) -> dict[str, Any]:
+    scope = _verify_invoke_request(request)
+    _validate_scope_against_request(req, scope)
+    return _execute_invoke(req, request, scope)
 
 
 @app.post("/webhook")

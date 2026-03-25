@@ -44,11 +44,17 @@ class OnboardingService:
 
     def _build_agent_catalog(self) -> list[dict[str, Any]]:
         catalog: list[dict[str, Any]] = []
+        fallback_endpoint = self._settings.runtime_public_base_url.strip()
+        primary_endpoint = self._settings.runtime_bootstrap_endpoint_url.strip()
+        if primary_endpoint == "":
+            primary_endpoint = fallback_endpoint
+
         primary = {
             "agent_id": self._settings.runtime_agent_id,
             "agent_version": self._settings.runtime_agent_version,
-            "runtime_id": self._settings.runtime_bootstrap_runtime_id,
-            "endpoint_url": self._settings.runtime_bootstrap_endpoint_url,
+            "runtime_id": self._settings.runtime_bootstrap_runtime_id
+            or self._settings.runtime_agent_id,
+            "endpoint_url": primary_endpoint,
             "enabled": True,
         }
         catalog.append(primary)
@@ -67,14 +73,16 @@ class OnboardingService:
                         ).strip()
                         if runtime_agent_id == "" or runtime_agent_version == "":
                             continue
+                        endpoint_url = str(item.get("endpoint_url", "")).strip()
+                        if endpoint_url == "":
+                            endpoint_url = fallback_endpoint
                         catalog.append(
                             {
                                 "agent_id": runtime_agent_id,
                                 "agent_version": runtime_agent_version,
-                                "runtime_id": str(item.get("runtime_id", "")).strip(),
-                                "endpoint_url": str(
-                                    item.get("endpoint_url", "")
-                                ).strip(),
+                                "runtime_id": str(item.get("runtime_id", "")).strip()
+                                or runtime_agent_id,
+                                "endpoint_url": endpoint_url,
                                 "enabled": bool(item.get("enabled", True)),
                             }
                         )
@@ -332,13 +340,22 @@ class OnboardingService:
                 api_base_url,
                 oauth_client_id=self._settings.simpleflow_client_id,
                 oauth_client_secret=self._settings.simpleflow_client_secret,
+                runtime_register_path=self._settings.simpleflow_runtime_register_path,
             )
         if self._settings.simpleflow_api_token == "":
             raise HTTPException(
                 status_code=503,
                 detail="machine credentials are required; set SIMPLEFLOW_CLIENT_ID and SIMPLEFLOW_CLIENT_SECRET",
             )
-        return SimpleFlowClient(api_base_url, self._settings.simpleflow_api_token)
+        return SimpleFlowClient(
+            api_base_url,
+            self._settings.simpleflow_api_token,
+            runtime_register_path=self._settings.simpleflow_runtime_register_path,
+        )
+
+    def _uses_runtime_connect_path(self) -> bool:
+        path = self._settings.simpleflow_runtime_register_path.strip().lower()
+        return path.endswith("/runtime/connect") or path.endswith("/connect")
 
     def run_onboarding_lifecycle(
         self,
@@ -363,35 +380,62 @@ class OnboardingService:
                 status_code=404, detail="agent is not available in catalog"
             )
 
+        uses_connect = self._uses_runtime_connect_path()
         registration = {
             "agent_id": runtime_agent_id,
             "agent_version": runtime_agent_version,
-            "execution_mode": "remote_runtime",
             "endpoint_url": str(config.get("endpoint_url", "")).strip(),
             "auth_mode": "jwt",
             "capabilities": ["chat", "webhook", "queue"],
             "runtime_id": str(config.get("runtime_id", "")).strip(),
         }
+        if not uses_connect:
+            registration["execution_mode"] = "remote_runtime"
+
+        endpoint_url = str(registration.get("endpoint_url", "")).strip()
+        if endpoint_url == "":
+            state["state"] = "failed"
+            state["message"] = "runtime endpoint URL is required for onboarding"
+            state["steps"]["create"] = "failed"
+            return state
 
         client = self._build_machine_control_plane_client()
         try:
+            result: dict[str, Any]
             ensure_registration_active = getattr(
                 client,
                 "ensure_runtime_registration_active",
                 None,
             )
-            result: dict[str, Any]
-            if callable(ensure_registration_active):
-                ensured = ensure_registration_active(registration=registration)
+            if not uses_connect and callable(ensure_registration_active):
+                ensured = ensure_registration_active(
+                    registration=registration,
+                )
                 if not isinstance(ensured, dict):
                     raise HTTPException(
                         status_code=502,
                         detail="registration lifecycle response must be an object",
                     )
                 result = ensured
+            elif uses_connect:
+                state["steps"]["create"] = "running"
+                created = client.register_runtime(
+                    registration,
+                )
+                registration_id = self.normalize_registration_id(created)
+                if registration_id != "":
+                    state["registration_id"] = registration_id
+                result = {
+                    "registration_id": registration_id,
+                    "created": True,
+                    "validated": False,
+                    "activated": False,
+                }
             else:
                 state["steps"]["create"] = "running"
-                created = client.register_runtime(registration)
+                created = client.register_runtime(
+                    registration,
+                )
                 registration_id = self.normalize_registration_id(created)
                 if registration_id == "":
                     state["state"] = "failed"
@@ -405,7 +449,9 @@ class OnboardingService:
                 state["steps"]["create"] = "success"
                 state["steps"]["validate"] = "running"
 
-                validation = client.validate_runtime_registration(registration_id)
+                validation = client.validate_runtime_registration(
+                    registration_id,
+                )
                 if (
                     isinstance(validation, dict)
                     and validation.get("validation_ok") is False
@@ -417,7 +463,9 @@ class OnboardingService:
 
                 state["steps"]["validate"] = "success"
                 state["steps"]["activate"] = "running"
-                client.activate_runtime_registration(registration_id)
+                client.activate_runtime_registration(
+                    registration_id,
+                )
                 result = {
                     "registration_id": registration_id,
                     "created": True,
@@ -426,7 +474,7 @@ class OnboardingService:
                 }
 
             registration_id = self.normalize_registration_id(result)
-            if registration_id == "":
+            if registration_id == "" and not uses_connect:
                 state["state"] = "failed"
                 state["steps"]["create"] = "failed"
                 raise HTTPException(
@@ -438,30 +486,36 @@ class OnboardingService:
             state["steps"]["create"] = (
                 "success" if result.get("created") is True else "skipped"
             )
-            state["steps"]["validate"] = (
-                "success" if result.get("validated") is True else "skipped"
-            )
-            state["steps"]["activate"] = (
-                "success" if result.get("activated") is True else "skipped"
-            )
+            if uses_connect:
+                state["steps"]["validate"] = "skipped"
+                state["steps"]["activate"] = "skipped"
+            else:
+                state["steps"]["validate"] = (
+                    "success" if result.get("validated") is True else "skipped"
+                )
+                state["steps"]["activate"] = (
+                    "success" if result.get("activated") is True else "skipped"
+                )
         except SimpleFlowAuthenticationError as exc:
             state["state"] = "blocked"
-            state["message"] = "machine auth failed for onboarding lifecycle"
+            state["message"] = "machine client auth failed for runtime connect"
             state["steps"]["create"] = "failed"
-            raise HTTPException(status_code=401, detail=str(exc)) from exc
+            return state
         except SimpleFlowAuthorizationError as exc:
             state["state"] = "blocked"
-            state["message"] = "machine token lacks lifecycle scope"
+            state["message"] = (
+                "machine client is forbidden for runtime connect; verify runtime.connect permission and that RUNTIME_BOOTSTRAP_RUNTIME_ID matches the machine client RuntimeID"
+            )
             state["steps"]["create"] = "failed"
-            raise HTTPException(status_code=403, detail=str(exc)) from exc
+            return state
         except SimpleFlowLifecycleError as exc:
             state["state"] = "failed"
             state["message"] = str(exc)
-            raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+            return state
         except Exception as exc:  # noqa: BLE001
             state["state"] = "failed"
             state["message"] = str(exc)
-            raise self._control_plane.map_error(exc) from exc
+            return state
         finally:
             client.close()
 

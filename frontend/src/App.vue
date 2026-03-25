@@ -475,6 +475,9 @@ async function recheckRegistration() {
     return
   }
   await preflightRegistration()
+  if (registrationGate.state === 'missing') {
+    await startOnboarding()
+  }
 }
 
 async function startOnboarding() {
@@ -959,7 +962,7 @@ onMounted(async () => {
         <header class="chat-panel-head">
           <div>
             <h2>HR Chat</h2>
-            <p class="help">Chat invoke goes through <code>POST /api/control-plane/runtime/invoke</code> on template backend.</p>
+            <p class="help">Chat invoke runs locally in backend workflow engine via <code>POST /api/control-plane/runtime/invoke</code>.</p>
           </div>
           <button type="button" class="btn ghost" @click="signOut">Sign Out</button>
         </header>
