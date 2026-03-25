@@ -10,13 +10,10 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends build-essential pkg-config libssl-dev \
     && rm -rf /var/lib/apt/lists/*
 
-COPY SimpleFlowSDKs/python /deps/SimpleFlowSDKs/python
-COPY SimpleAgents /deps/SimpleAgents
+COPY backend/pyproject.toml /workspace/backend/pyproject.toml
+RUN pip install --no-cache-dir --upgrade pip \
+    && pip install --no-cache-dir -e /workspace/backend
 
-RUN pip install --no-cache-dir fastapi uvicorn PyJWT \
-    && pip install --no-cache-dir -e /deps/SimpleFlowSDKs/python \
-    && pip install --no-cache-dir -e /deps/SimpleAgents/crates/simple-agents-py
-
-COPY SimpleFlowTestTempaltes/SimpleFlowHRAgentSystem/backend /workspace/backend
+COPY backend /workspace/backend
 
 CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8091"]
